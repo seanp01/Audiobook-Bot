@@ -25,9 +25,6 @@ The repository consists of the following key services and modules:
   - Multi-user support with isolated playback sessions.
   - Integration with SMB shares for accessing media files.
 
----
-
-
 
 ---
 
