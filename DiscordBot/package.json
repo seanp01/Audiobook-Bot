@@ -7,8 +7,9 @@
     "start": "node bot.js"
   },
   "author": "sparkertech",
-  "license": "MIT",
+  "license": "ISC",
   "dependencies": {
+    "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.18.0",
     "ascii-table": "0.0.9",
     "axios": "^1.6.7",
@@ -26,8 +27,12 @@
     "ascii-table": "0.0.9",
     "colors": "^1.4.0"
   },
-  "version": "1.31.0",
+  "version": "1.35.0",
   "changelog": {
+    "1.35.0": "Fix for the next and prev chapter bugs. Skip and back 10 second increment commands are still bugged. ~ Sean Parker",
+    "1.34.0": "Update for the dvr ffmpeg audiobook service ~ Sean Parker",
+    "1.33.0": "Bug fix for resetting the update seek UI flag if an exception is thrown during the update. ~ Sean Parker",
+    "1.32.0": "Bug fix for properly exiting the bots when a user leaves their channel. ~ Sean Parker",
     "1.31.0": "Moved sensitive paths and addresses to the .env process file for public facing repo purposes. ~ Sean Parker",
     "1.30.0": "First semi-stable version of the master bot and minion bot system. Bot is running 24/7 now. ~ Sean Parker",
     "1.29.0": "Changes to fix various bugs related to minion bot configuration. Committing before updating the bot. ~ Sean Parker",
@@ -42,7 +47,7 @@
     "1.20.0": "Changes to improve the debouncing, and final commit before bot supports 24/7 operation. ~ Sean Parker",
     "1.19.0": "Small fixes for bot, more debouncing for UI updates. ~ Sean Parker",
     "1.18.0": "Added a debouncer to limit UI update processing. ~ Sean Parker",
-    "1.17.0": "Small changes to support the bot on the pi. ~ Sean Parker", 
+    "1.17.0": "Small changes to support the bot on the pi. ~ Sean Parker",
     "1.16.0": "More small path changes for service support. ~ Sean Parker",
     "1.15.0": "Small changes for the service to support running on the host SMB device (pathing issues). ~ Sean Parker",
     "1.14.0": "Added a service for the DVR pc to host the file manipulation and conversion controlled by an API consisting of gets and posts. ~ Sean Parker",

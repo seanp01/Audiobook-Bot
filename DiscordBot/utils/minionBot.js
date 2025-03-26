@@ -1,21 +1,30 @@
 const { getUserBooksInProgress, loadUserPositions, scheduleUserPositionSaving, listAudiobooks, getM4BCoverImage, getM4BMetaData, findClosestMatch, getFileNameFromTitle, skipAudiobook, retrieveAudiobookFilePaths, selectAudiobookAndRetrievePaths, updateAudiobookCache, storeUserPosition, getUserPosition, } = require('./smbAccess');
 const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, getVoiceConnection, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+const { v4: uuidv4 } = require('uuid');
+require('@discordjs/opus');
 const { setInterval, clearInterval } = require('timers');
-const { execFile } = require('child_process');
+const { exec, spawn, fork, execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
+const os = require('os');
 
 // Retrieve minionId and minionToken from command-line arguments
-const [minionId, minionToken] = [process.argv[2], process.env[`MINION_BOT_${process.argv[2].toUpperCase()}_TOKEN`]];
+const [minionId, minionToken] = process.argv.slice(2);
 
 const tempFiles = new Set(); // Track temporary files created by this minion
 const audioDurationCache = new Map();
 const userCoverImages = new Map();
 const chapterDurationCache = new Map(); // Cache for chapter durations
 const userPositionsCache = new Map(); // Cache for user positions
+const tempToOriginalMap = new Map(); // Map temporary file paths to original file paths
 const userPositionFilePath = path.join(__dirname, 'userPosition.json');
 
+const dvrAddress = process.env.DVR_ADDRESS;
+const dvrPort = process.env.DVR_PORT;
+
+let isUpdatingSeekUI = false; // Lock flag for updateSeekUI
 let playbackData = null;
 let player = null;
 let connection = null;
@@ -23,6 +32,9 @@ let storeInterval = null;
 let updateInterval = null;
 let guild = null;
 let playbackUiMessage = null; 
+
+let initialTimestamp = 0;
+let initialPartIndex = 0;
 
 const client = new Client({
   intents: [
@@ -37,46 +49,106 @@ client.once('ready', () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isButton()) return;
+  try {
+    // Ensure the interaction is a button interaction
+    if (!interaction.isButton()) return;
 
-  const command = interaction.customId;
+    const command = interaction.customId;
 
-  switch (command) {
-    case 'play_pause':
-      if (!player) return;
-      if (player.state.status === AudioPlayerStatus.Playing) {
-        await handlePlaybackControl('pause');
-      } else if (player.state.status === AudioPlayerStatus.Paused) {
-        await handlePlaybackControl('play');
+    // Acknowledge the interaction immediately to prevent "This interaction failed" errors
+    if (!interaction.deferred && !interaction.replied) {
+      try {
+        await interaction.deferUpdate(); // Acknowledge the interaction without sending a visible reply
+      } catch (error) {
+        console.error('Error acknowledging interaction');
       }
-      break;
+    }
 
-    case 'skip':
-      await handlePlaybackControl('skip');
-      break;
+    // Handle the button commands
+    switch (command) {
+      case 'play_pause':
+        if (!player) {
+          console.error('Player is not initialized.');
+          return;
+        }
+        if (player.state.status === AudioPlayerStatus.Playing) {
+          await handlePlaybackControl('pause');
+        } else if (player.state.status === AudioPlayerStatus.Paused) {
+          await handlePlaybackControl('play');
+        }
+        break;
 
-    case 'back':
-      await handlePlaybackControl('back');
-      break;
+      case 'skip':
+        await handleSkipCommand();
+        break;
 
-    default:
-      console.error(`Unknown button interaction: ${command}`);
+      case 'back':
+        await handleBackCommand();
+        break;
+
+      case 'next':
+        await handleNextChapterCommand();
+        break;
+
+      case 'prev':
+        await handlePreviousChapterCommand();
+        break;
+
+      default:
+        console.error(`Unknown button interaction: ${command}`);
+        break;
+    }
+  } catch (error) {
+    console.error('Error handling interaction:', error);
+
+    // Notify the user if an error occurs
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp();
+    }
   }
+});
 
-  await interaction.deferUpdate(); // Acknowledge the interaction
+client.on('voiceStateUpdate', (oldState, newState) => {
+  if (!playbackData) return;
+
+  const userID = playbackData.userID;
+  const channelID = playbackData.channelID;
+
+  // Check if the user left the voice channel
+  if (oldState.channelId === channelID && newState.channelId !== channelID) {
+    console.log(`User ${userID} left the voice channel. Ending session.`);
+    endSession();
+    clearInterval(updateInterval);
+  }
 });
 
 // Listen for messages from the masterBot
 process.on('message', async (message) => {
   try {
     switch (message.type) {
-      case 'playback': // Handle only the playback initiation
+      case 'playback':
         playbackData = message.data;
-        if (!validatePlaybackData(playbackData)) {
-          console.error('Invalid playbackData received. Aborting playback.');
+
+        // Retrieve audiobook parts and metadata
+        const { outputPaths: chapterParts, originalFilePath, metadata, coverImagePath } = await selectAudiobookAndRetrievePaths(
+          playbackData.audiobookTitle,
+          playbackData.currentChapter,
+          playbackData.currentPart,
+          playbackData.currentTimestamp
+        );
+
+        if (!chapterParts || chapterParts.length === 0) {
+          console.error('Error: No parts found.');
           return;
         }
-        await startPlayback(); // Start or resume playback
+
+        playbackData.chapterParts = chapterParts;
+        tempToOriginalMap.set(chapterParts[playbackData.currentPart], originalFilePath); // Map the temp file to the original file
+        playbackData.coverImageUrl = getDynamicCoverImageUrl(coverImagePath);
+        playbackData.author = metadata.author || 'Unknown Author';
+
+        // Start playback
+        await startPlayback();
         break;
 
       default:
@@ -98,7 +170,7 @@ process.on('exit', () => {
   // Sync positions to file before exiting
   syncPositionsToFile();
   console.log('User positions saved to file before exiting.');
-
+  clearTempFiles();
   console.log('Minion bot process exiting. Cleaned up resources.');
 });
 
@@ -109,6 +181,36 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
+
+async function endSession() {
+  try {
+    if (player) {
+      player.stop(); // Stop playback
+      console.log('Playback stopped.');
+    }
+
+    playbackData = null; // Clear playback data
+
+    if (connection) {
+      console.log('Destroying voice connection...');
+      await new Promise((resolve) => {
+        connection.destroy();
+        resolve(); // Resolve the promise after destroying the connection
+      });
+      connection = null;
+      console.log('Voice connection destroyed.');
+    }
+
+    console.log('Session ended by the user.');
+
+    // Trigger process exit to save positions and clean up
+    console.log('Exiting process...');
+    process.exit(0); // Exit the process with a success code
+  } catch (error) {
+    console.error('Error ending session:', error);
+    process.exit(1); // Exit the process with an error code
+  }
+}
 
 async function startPlayback() {
   try {
@@ -126,14 +228,16 @@ async function startPlayback() {
 
     // Create the connection if it doesn't exist
     if (!connection) {
-      await connectToVoiceChannel(channelID, guildID); // Pass the guildID
+      await connectToVoiceChannel(channelID, guildID);
     }
 
     // Create the player if it doesn't exist
     if (!player) {
       createPlayer();
     }
-
+    // Set up interval for UI updates
+    if (updateInterval) clearInterval(updateInterval);
+    updateInterval = setInterval(updateSeekUI, 1000);
     // Create the audio resource and play it
     const resource = createAudioResource(chapterParts[currentPart]);
     player.play(resource);
@@ -142,11 +246,6 @@ async function startPlayback() {
     connection.subscribe(player);
 
     console.log(`Playing part ${currentPart + 1} of chapter ${playbackData.currentChapter}.`);
-    // Set up interval for UI updates
-    if (updateInterval) clearInterval(updateInterval);
-    updateInterval = setInterval(() => {
-      updateSeekUI();
-    }, 1000); // Attempt to update every second, but throttling will limit it
   } catch (error) {
     console.error('Error starting playback:', error);
   }
@@ -242,11 +341,8 @@ async function handleNextPart() {
   }
 }
 
-let isUpdatingSeekUI = false; // Lock flag for updateSeekUI
-
 async function updateSeekUI() {
   if (isUpdatingSeekUI) {
-    console.log('updateSeekUI is already in progress. Skipping this call.');
     return; // Exit if the function is already running
   }
 
@@ -265,11 +361,26 @@ async function updateSeekUI() {
     // Retrieve the cached part durations
     const partDurations = await calculateTotalChapterDuration(playbackData.chapterParts);
 
+    // Check if the current file is a temporary file
+    const currentFilePath = playbackData.chapterParts[currentPart];
+    const originalFilePath = tempToOriginalMap.get(currentFilePath);
+
+    let timeRemovedFromStart = 0;
+
+    if (originalFilePath) {
+      // If the file is a temporary file, calculate the time removed from the start
+      const originalDuration = await getCachedAudioDuration(originalFilePath);
+      const currentDuration = await getCachedAudioDuration(currentFilePath);
+
+      timeRemovedFromStart = originalDuration - currentDuration;
+      console.log(`Time removed from start: ${timeRemovedFromStart} ms`);
+    }
+
     // Calculate the cumulative duration up to the current part
     const timeToCurrentPart = partDurations.slice(0, currentPart).reduce((sum, duration) => sum + duration, 0);
 
-    // Calculate the total timestamp
-    const totalTimestamp = currentTimestamp + timeToCurrentPart;
+    // Adjust the total timestamp to account for the time removed
+    const totalTimestamp = currentTimestamp + timeToCurrentPart + timeRemovedFromStart;
 
     // Calculate the total duration of the chapter
     const totalChapterDuration = partDurations.reduce((sum, duration) => sum + duration, 0);
@@ -345,6 +456,202 @@ async function updateSeekUI() {
   }
 }
 
+async function handleSkipCommand() {
+  try {
+    const skipDuration = 10000; // Skip forward 10 seconds
+    playbackData.currentTimestamp += skipDuration;
+
+    const { chapterParts, currentPart, currentTimestamp } = playbackData;
+
+    // Check if the current file is a temporary file
+    const originalFilePath = tempToOriginalMap.get(chapterParts[currentPart]) || chapterParts[currentPart];
+
+    if (tempToOriginalMap.has(chapterParts[currentPart])) {
+      // Handle seek locally for temporary files
+      const newFilePath = await handleLocalSeek(chapterParts[currentPart], currentTimestamp);
+      playbackData.chapterParts[currentPart] = newFilePath;
+    } else {
+      // Generate a new MP3 file for the new timestamp
+      const newFilePath = await handleOriginalFileSeek(originalFilePath, currentTimestamp);
+      playbackData.chapterParts[currentPart] = newFilePath;
+    }
+
+    // Update playback with the new file
+    await updatePlayback();
+    console.log(`Skipped forward 10 seconds.`);
+  } catch (error) {
+    console.error('Error handling skip command:', error);
+  }
+}
+
+async function handleBackCommand() {
+  try {
+    const rewindDuration = 10000; // Rewind 10 seconds
+    playbackData.currentTimestamp = Math.max(0, playbackData.currentTimestamp - rewindDuration);
+
+    const { chapterParts, currentPart, currentTimestamp } = playbackData;
+
+    // Check if the current file is a temporary file
+    const originalFilePath = tempToOriginalMap.get(chapterParts[currentPart]) || chapterParts[currentPart];
+
+    if (tempToOriginalMap.has(chapterParts[currentPart])) {
+      // Handle seek locally for temporary files
+      const newFilePath = await handleLocalSeek(chapterParts[currentPart], currentTimestamp);
+      playbackData.chapterParts[currentPart] = newFilePath;
+    } else {
+      // Send a request to the DVR to generate a new MP3 file
+      const response = await axios.post(`http://${dvrAddress}:${dvrPort}/convert`, {
+        filePath: originalFilePath,
+        startTime: Math.floor(currentTimestamp / 1000), // Convert milliseconds to seconds
+      });
+
+      if (response.data && response.data.outputFilePath) {
+        playbackData.chapterParts[currentPart] = response.data.outputFilePath;
+      } else {
+        console.error('Error: DVR did not return a valid output file path.');
+      }
+    }
+
+    // Update playback with the new file
+    await updatePlayback();
+    console.log(`Rewound 10 seconds.`);
+  } catch (error) {
+    console.error('Error handling back command:', error);
+  }
+}
+
+async function handleLocalSeek(tempFilePath, newTimestamp) {
+  try {
+    const originalFilePath = tempToOriginalMap.get(tempFilePath);
+
+    if (newTimestamp < 0) {
+      // Seek goes beyond the start of the temporary file, revert to the original file
+      console.log('Seek goes beyond the start of the temporary file. Reverting to the original file.');
+      return await handleOriginalFileSeek(originalFilePath, newTimestamp);
+    }
+
+    // Generate a new temporary file for the seeked position
+    const newTempFilePath = path.join(path.dirname(tempFilePath), `${uuidv4()}.mp3`);
+
+    const ffmpeg = spawn('ffmpeg', [
+      '-loglevel', 'error',
+      '-ss', Math.floor(newTimestamp / 1000), // Convert milliseconds to seconds
+      '-i', originalFilePath,
+      '-vn',
+      '-b:a', '192k',
+      '-c:a', 'copy',
+      newTempFilePath,
+    ]);
+
+    return new Promise((resolve, reject) => {
+      ffmpeg.on('close', (code) => {
+        if (code === 0) {
+          console.log(`Generated new temporary file: ${newTempFilePath}`);
+          tempToOriginalMap.set(newTempFilePath, originalFilePath); // Map the new temp file to the original file
+          resolve(newTempFilePath);
+        } else {
+          reject(new Error(`FFmpeg exited with code ${code}`));
+        }
+      });
+    });
+  } catch (error) {
+    console.error('Error handling local seek:', error);
+    throw error;
+  }
+}
+
+async function handleOriginalFileSeek(originalFilePath, newTimestamp) {
+  try {
+    const localOutputDir = path.join(__dirname, '..\\temp');
+    const newTempFilePath = path.join(localOutputDir, `${uuidv4()}.mp3`);
+    const ffmpeg = spawn('ffmpeg', [
+      '-ss', Math.floor(newTimestamp / 1000), // Convert milliseconds to seconds
+      '-i', originalFilePath,
+      '-vn',
+      '-b:a', '192k',
+      '-c:a', 'copy',
+      newTempFilePath,
+    ]);
+
+    return new Promise((resolve, reject) => {
+      ffmpeg.on('close', (code) => {
+        if (code === 0) {
+          console.log(`Generated new temporary file from original file: ${newTempFilePath}`);
+          tempToOriginalMap.set(newTempFilePath, originalFilePath); // Map the new temp file to the original file
+          resolve(newTempFilePath);
+        } else {
+          reject(new Error(`FFmpeg exited with code ${code}`));
+        }
+      });
+    });
+  } catch (error) {
+    console.error('Error handling original file seek:', error);
+    throw error;
+  }
+}
+
+async function handleNextChapterCommand() {
+  try {
+    playbackData.currentChapter += 1; // Move to the next chapter
+    playbackData.currentPart = 0; // Reset to the first part of the new chapter
+    playbackData.currentTimestamp = 0; // Reset the timestamp
+
+    // Load the next chapter
+    const { outputPaths: chapterParts } = await selectAudiobookAndRetrievePaths(
+      playbackData.audiobookTitle,
+      playbackData.currentChapter,
+      0,
+      0
+    );
+
+    if (!chapterParts || chapterParts.length === 0) {
+      console.error(`No parts found for chapter ${playbackData.currentChapter}.`);
+      console.log('Playback has reached the end of the audiobook.');
+      return;
+    }
+
+    playbackData.chapterParts = chapterParts;
+
+    console.log(`Loaded chapter ${playbackData.currentChapter}.`);
+    await startPlayback(); // Start playback for the new chapter
+  } catch (error) {
+    console.error('Error handling next chapter command:', error);
+  }
+}
+
+async function handlePreviousChapterCommand() {
+  try {
+    if (playbackData.currentChapter === 1) {
+      console.log('Already at the first chapter. Cannot go back further.');
+      return;
+    }
+
+    playbackData.currentChapter -= 1; // Move to the previous chapter
+    playbackData.currentPart = 0; // Reset to the first part of the new chapter
+    playbackData.currentTimestamp = 0; // Reset the timestamp
+
+    // Load the previous chapter
+    const { outputPaths: chapterParts } = await selectAudiobookAndRetrievePaths(
+      playbackData.audiobookTitle,
+      playbackData.currentChapter,
+      0,
+      0
+    );
+
+    if (!chapterParts || chapterParts.length === 0) {
+      console.error(`No parts found for chapter ${playbackData.currentChapter}.`);
+      return;
+    }
+
+    playbackData.chapterParts = chapterParts;
+
+    console.log(`Loaded chapter ${playbackData.currentChapter}.`);
+    await startPlayback(); // Start playback for the new chapter
+  } catch (error) {
+    console.error('Error handling previous chapter command:', error);
+  }
+}
+
 async function connectToVoiceChannel(channelId, guildId) {
   try {
     // Retrieve the guild object using the guild ID
@@ -388,6 +695,7 @@ async function clearTempFiles() {
               console.error(`Error deleting file ${tempFile}:`, err);
             } else {
               console.log(`Deleted file ${tempFile}`);
+              tempToOriginalMap.delete(tempFile); // Remove the mapping
             }
           });
         }
@@ -420,27 +728,6 @@ async function createInfoRow(userID, title, author, chapter, part, timestamp) {
   }
 
   return embed;
-}
-
-function getDynamicCoverImageUrl(filePath) {
-  const isWindows = os.platform() === 'win32';
-  const baseUrl = isWindows
-    ? 'http://localhost:8080/images/' // Localhost for Windows
-    : 'http://10.0.0.223:8080/images/'; // Replace <pi-ip-address> with the Pi's IP address
-
-  const fileName = path.basename(filePath); // Extract the file name from the path
-  return `${baseUrl}${fileName}`;
-}
-
-function formatTimestamp(milliseconds) {
-  const totalSeconds = Math.floor(milliseconds / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  return [hours, minutes, seconds]
-    .map((unit) => String(unit).padStart(2, '0'))
-    .join(':');
 }
 
 async function getAudioDuration(filePath) {
@@ -525,6 +812,42 @@ async function calculateTotalChapterDuration(chapterParts) {
   return partDurations;
 }
 
+
+async function handlePlaybackControl(command) {
+  try {
+    switch (command) {
+      case 'pause':
+        if (player && player.state.status === AudioPlayerStatus.Playing) {
+          player.pause();
+          console.log('Playback paused.');
+        }
+        break;
+
+      case 'play':
+        if (player && player.state.status === AudioPlayerStatus.Paused) {
+          player.unpause();
+          console.log('Playback resumed.');
+        }
+        break;
+
+      case 'skip':
+        playbackData.currentTimestamp += 10000; // Skip forward 10 seconds
+        await updatePlayback();
+        break;
+
+      case 'back':
+        playbackData.currentTimestamp = Math.max(0, playbackData.currentTimestamp - 10000); // Skip back 10 seconds
+        await updatePlayback();
+        break;
+
+      default:
+        console.error(`Unknown playback control command: ${command}`);
+    }
+  } catch (error) {
+    console.error('Error handling playback control:', error);
+  }
+}
+
 function syncPositionsToFile() {
   try {
     let existingData = {};
@@ -595,12 +918,44 @@ function createPlayer() {
       }
     });
 
-    player.on(AudioPlayerStatus.Playing, () => {
-      console.log('Playback started.');
+    let isPlayingEventLocked = false; // Lock flag for the Playing event
+
+    player.on(AudioPlayerStatus.Playing, async () => {
+      if (isPlayingEventLocked) {
+        return; // Exit if the event is already being handled
+      }
+    
+      isPlayingEventLocked = true; // Set the lock
+    
+      try {
+        console.log('Playback started.');    
+        // Add your logic here (e.g., updating UI, logging, etc.)
+        await updateSeekUI(); // Example: Update the seek UI
+      } catch (error) {
+        console.error('Error handling AudioPlayerStatus.Playing event:', error);
+      } finally {
+        isPlayingEventLocked = false; // Release the lock
+      }
     });
 
-    player.on(AudioPlayerStatus.Paused, () => {
-      console.log('Playback paused.');
+    let isPausingEventLocked = false; // Lock flag for the Playing event
+
+    player.on(AudioPlayerStatus.Paused, async () => {
+      if (isPausingEventLocked) {
+        return; // Exit if the event is already being handled
+      }
+
+      isPausingEventLocked = true; // Set the lock
+
+      try {
+        console.log('Playback paused.');    
+        // Add your logic here (e.g., updating UI, logging, etc.)
+        await updateSeekUI(); // Example: Update the seek UI
+      } catch (error) {
+        console.error('Error handling AudioPlayerStatus.Paused event:', error);
+      } finally {
+        isPlayingEventLocked = false; // Release the lock
+      }
     });
 
     player.on('error', (error) => {
@@ -613,39 +968,40 @@ function createPlayer() {
   }
 }
 
-async function handlePlaybackControl(command) {
-  try {
-    switch (command) {
-      case 'pause':
-        if (player && player.state.status === AudioPlayerStatus.Playing) {
-          player.pause();
-          console.log('Playback paused.');
-        }
-        break;
+let inactivityTimeout = null;
 
-      case 'play':
-        if (player && player.state.status === AudioPlayerStatus.Paused) {
-          player.unpause();
-          console.log('Playback resumed.');
-        }
-        break;
+function resetInactivityTimeout() {
+  if (inactivityTimeout) clearTimeout(inactivityTimeout);
 
-      case 'skip':
-        playbackData.currentTimestamp += 10000; // Skip forward 10 seconds
-        await updatePlayback();
-        break;
+  inactivityTimeout = setTimeout(() => {
+    console.log('Session ended due to inactivity.');
+    endSession();
+  }, 5 * 60 * 1000); // 5 minutes of inactivity
+}
 
-      case 'back':
-        playbackData.currentTimestamp = Math.max(0, playbackData.currentTimestamp - 10000); // Skip back 10 seconds
-        await updatePlayback();
-        break;
+const coverArtAddress = process.env.COVER_ART_ADDRESS;
+const coverArtPort = process.env.COVER_ART_PORT;
+const piAddress = process.env.AUDIOBOOK_PI_ADDRESS;
 
-      default:
-        console.error(`Unknown playback control command: ${command}`);
-    }
-  } catch (error) {
-    console.error('Error handling playback control:', error);
-  }
+function getDynamicCoverImageUrl(filePath) {
+  const isWindows = os.platform() === 'win32';
+  const baseUrl = isWindows
+    ? `http://${coverArtAddress}:${coverArtPort}/images/` 
+    : `http://${coverArtAddress}:${coverArtPort}/images/`; 
+
+  const fileName = path.basename(filePath); // Extract the file name from the path
+  return `${baseUrl}${fileName}`;
+}
+
+function formatTimestamp(milliseconds) {
+  const totalSeconds = Math.floor(milliseconds / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  return [hours, minutes, seconds]
+    .map((unit) => String(unit).padStart(2, '0'))
+    .join(':');
 }
 
 function throttle(func, limit) {

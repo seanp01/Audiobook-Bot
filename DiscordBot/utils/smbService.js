@@ -11,6 +11,7 @@ const tempDir = path.join(__dirname, 'temp'); // Temporary directory for process
 const os = require('os'); // Import the os module
 
 const dvrDeviceName = process.env.DVR_DEVICE_NAME;
+require('dotenv').config({ path: path.resolve(__dirname, '.env') }); // Explicitly load .env from the DiscordBot directory
 
 // Ensure the temp directory exists
 if (!fs.existsSync(tempDir)) {
@@ -98,21 +99,36 @@ app.post('/cover', (req, res) => {
 
 // Endpoint to convert a file
 app.post('/convert', (req, res) => {
-    const { filePath, startTime, duration } = req.body;
+    const { filePath, startTime } = req.body;
   
     // Normalize the path based on the platform
     const normalizedPath = normalizePath(filePath);
     const fullPath = path.join(audiobooksDir, normalizedPath);
     const outputFilePath = path.join(tempDir, `${uuidv4()}.mp3`);
-  
-    const ffmpeg = spawn('ffmpeg', [
-      '-i', fullPath,
-      '-ss', startTime,
-      '-t', duration,
-      '-acodec', 'libmp3lame',
-      '-b:a', '192k',
-      outputFilePath,
+    console.log('filePath', filePath);
+    console.log('normalizedPath', normalizedPath);
+    console.log('startTime', startTime);
+    console.log('fullPath', fullPath);
+    console.log('outputFilePath', outputFilePath);
+
+    const ffmpeg = spawn("ffmpeg", [
+      "-loglevel", "error", // Suppress extra logs, show only errors
+      "-ss", startTime,
+      "-i", fullPath, // Use the first selected file
+      "-vn",
+      "-b:a", "192k",
+      "-c:a", "copy",
+      outputFilePath
     ]);
+
+    // const ffmpeg = spawn('ffmpeg', [
+    //   '-i', fullPath,
+    //   '-ss', startTime,
+    //   '-t', duration,
+    //   '-acodec', 'libmp3lame',
+    //   '-b:a', '192k',
+    //   outputFilePath,
+    // ]);
   
     ffmpeg.on('close', (code) => {
       if (code === 0) {

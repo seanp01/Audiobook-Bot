@@ -5,6 +5,7 @@ const fuzzball = require('fuzzball');
 const { exec, spawn, execFile } = require('child_process');
 const { v4: uuidv4 } = require('uuid'); // Import uuid
 const { createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') }); // Explicitly load .env from the DiscordBot directory
 
 const cacheFilePath = path.join(__dirname, 'audiobookCache.json');
 const userPositionFilePath = path.join(__dirname, 'userPosition.json');
@@ -23,6 +24,8 @@ const dvrAddress = process.env.DVR_ADDRESS;
 const dvrPort = process.env.DVR_PORT;
 const hostServiceUrl = `http://${dvrAddress}:${dvrPort}`;
 const dvrDeviceName = process.env.DVR_DEVICE_NAME;
+
+const tempToOriginalMap = new Map(); // Map temporary file paths to original file paths
 
 // Ensure the local output directory exists
 if (!fs.existsSync(localOutputDir)) {
@@ -62,10 +65,9 @@ async function listAudiobooks() {
 }
 
 async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime = 0, duration = MAX_FILE_SIZE) {
-  // Determine the base directory based on the operating system
   const platform = os.platform();
   const baseDir = platform === 'win32' 
-    ? '\\\\${dvrDeviceName}\\Audiobooks' // Windows UNC path
+    ? `\\\\${dvrDeviceName}\\Audiobooks` // Windows UNC path
     : '/mnt/audiobooks'; // Linux mount point
 
   const audiobookDir = path.join(baseDir, fileName.split('.')[0]);
@@ -115,6 +117,8 @@ async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime
       selectedFiles.push(filePath);
     }
 
+    let originalFilePath = null;
+
     // If a startTime is provided, use ffmpeg to copy the mp3 locally starting at the desired timestamp
     if (startTime > 0 && selectedFiles.length > 0) {
       const uniqueFileName = `${uuidv4()}.mp3`; // Generate a unique filename
@@ -141,15 +145,18 @@ async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime
         ffmpeg.on("close", (code) => {
           console.log(`FFmpeg exited with code ${code}`);
           if (code === 0) {
+            // Map the temporary file to the original file
+            tempToOriginalMap.set(localFilePath, selectedFiles[part]);
+            originalFilePath = selectedFiles[part]; // Store the original file path
             selectedFiles[part] = localFilePath;
-            resolve(selectedFiles);
+            resolve({ outputPaths: selectedFiles, originalFilePath }); // Include the original file path
           } else {
             reject(new Error(`FFmpeg exited with code ${code}`));
           }
         });
       });
     } else {
-      return selectedFiles;
+      return { outputPaths: selectedFiles, originalFilePath: null }; // No replacement, originalFilePath is null
     }
   } catch (error) {
     console.error('Error retrieving audiobook file paths:', error);
@@ -158,7 +165,7 @@ async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime
 }
 
 async function selectAudiobookAndRetrievePaths(userInput, chapter = 0, part = 0, timestamp = 0) {
-  const baseDir = os.platform() === 'win32' ? '\\\\${dvrDeviceName}\\Audiobooks' : '/mnt/audiobooks';
+  const baseDir = os.platform() === 'win32' ? `\\\\${dvrDeviceName}\\Audiobooks` : '/mnt/audiobooks';
   console.log('function selectAudiobook()');
   try {
     // Update the cache if it's expired
@@ -172,12 +179,12 @@ async function selectAudiobookAndRetrievePaths(userInput, chapter = 0, part = 0,
     }
     console.log('Closest match:', closestMatch);
     const fileName = titleToFileMap[closestMatch];
-    const outputPaths = await retrieveAudiobookFilePaths(fileName, chapter, part, timestamp);
+    const { outputPaths, originalFilePath } = await retrieveAudiobookFilePaths(fileName, chapter, part, timestamp);
 
     // Extract metadata and cover image
     const metadata = await getM4BMetadata(path.join(baseDir, fileName));
     const coverImagePath = await getM4BCoverImage(path.join(baseDir, fileName));
-    return { outputPaths, metadata, coverImagePath }; // Ensure this returns an object
+    return { outputPaths, originalFilePath, metadata, coverImagePath }; // Include the original file path
   } catch (error) {
     console.error('Error selecting audiobook:', error);
     throw error;
@@ -278,6 +285,9 @@ async function listAudiobooksFromSource() {
 }
 
 function getUserBooksInProgress(userId) {
+  if (!userPositionsCache) {
+    loadUserPositions();
+  }
   if (!userPositionsCache[userId]) {
     return [];
   }
@@ -288,10 +298,16 @@ function getUserBooksInProgress(userId) {
 }
 
 function loadUserPositions() {
-  if (fs.existsSync(userPositionFilePath)) {
-    userPositionsCache = JSON.parse(fs.readFileSync(userPositionFilePath, 'utf8'));
-  } else {
-    userPositionsCache = {};
+  try {
+    if (fs.existsSync(userPositionFilePath)) {
+      const fileData = fs.readFileSync(userPositionFilePath, 'utf8');
+      userPositionsCache = JSON.parse(fileData);
+    } else {
+      userPositionsCache = {};
+    }
+  } catch (error) {
+    console.error('Error loading user positions. Resetting to an empty object:', error);
+    userPositionsCache = {}; // Reset to an empty object if the file is invalid
   }
 }
 
@@ -303,10 +319,24 @@ function storeUserPosition(userId, audiobookTitle, chapter, part, timestamp, int
   userPositionsCache[userId][audiobookTitle] = { chapter, part, timestamp };
 }
 
-// Periodically write the in-memory user positions to the file
+let isSaving = false;
+
 function saveUserPositionsToFile() {
-  fs.writeFileSync(userPositionFilePath, JSON.stringify(userPositionsCache, null, 2));
-  console.log('User positions saved to file');
+  if (isSaving) {
+    console.log('Save operation already in progress. Skipping this call.');
+    return;
+  }
+
+  isSaving = true;
+
+  try {
+    fs.writeFileSync(userPositionFilePath, JSON.stringify(userPositionsCache, null, 2));
+    console.log('User positions saved to file');
+  } catch (error) {
+    console.error('Error saving user positions to file:', error);
+  } finally {
+    isSaving = false;
+  }
 }
 
 // Schedule periodic saving of user positions every 30 minutes
@@ -415,9 +445,9 @@ function getM4BCoverImage(filePath) {
   });
 }
 
-async function convertFile(filePath, startTime, duration) {
+async function convertFile(filePath, startTime) {
   try {
-    const response = await axios.post(`${hostServiceUrl}/convert`, { filePath, startTime, duration });
+    const response = await axios.post(`${hostServiceUrl}/convert`, { filePath, startTime });
     return response.data.outputFilePath;
   } catch (error) {
     console.error('Error converting file:', error);

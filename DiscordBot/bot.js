@@ -1,5 +1,4 @@
-﻿console.log('Loaded Environment Variables:', process.env);
-const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
+﻿const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const express = require('express');
 const path = require('path');
 const colors = require('colors'); 
@@ -25,12 +24,14 @@ const player1ID = process.env.MINION_BOT_1_APP_ID;
 const player2ID = process.env.MINION_BOT_2_APP_ID;
 const player1Token = process.env.MINION_BOT_1_TOKEN;
 const player2Token = process.env.MINION_BOT_2_TOKEN;
+const streamPalToken = process.env.MASTER_BOT_TOKEN;
 
 // Network addresses
 const macAddress = process.env.MAC_ADDRESS;
-const ipAddress = process.env.IP_ADDRESS;
-const covertArtAddress = process.env.COVER_ART_ADDRESS;
+const mediaPIIPAddress = process.env.MEDIA_PI_ADDRESS;
+const coverArtAddress = process.env.COVER_ART_ADDRESS;
 const dvrAddress = process.env.DVR_ADDRESS;
+const audiobookPIIPAddress = process.env.AUDIOBOOK_PI_ADDRESS;
 
 const channelName = process.env.CHANNEL_NAME;;
 
@@ -233,7 +234,6 @@ masterBot.once('ready', async () => {
   const onlineMemberNames = onlineMembers.map(member => member.user.username).join(', ');
   console.log(`Online members: ${onlineMemberNames}`);
   loadUserPositions();
-  scheduleUserPositionSaving();
   await checkAndMountNetworkDrive();
 });
 
@@ -258,7 +258,7 @@ masterBot.on('interactionCreate', async (interaction) => {
           break;
         case Commands.YOUTUBE:
           const input = interaction.options.getString('url');
-          await axios.post('http://' + ipAddress + ':' + piServicePort + '/youtube', { url: input })
+          await axios.post('http://' + mediaPIIPAddress + ':' + piServicePort + '/youtube', { url: input })
             .then(response => {
               console.log(response.data);
             })
@@ -402,21 +402,6 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
       currentPart = userPosition.part;
     }
 
-    // Retrieve audiobook parts and metadata
-    const { outputPaths: initialChapterParts, metadata, coverImagePath } = await selectAudiobookAndRetrievePaths(
-      selectedAudiobook,
-      currentChapter,
-      currentPart,
-      currentTimestamp
-    );
-
-    if (!initialChapterParts || initialChapterParts.length === 0) {
-      if (!interaction.replied) {
-        await interaction.followUp('Error: No parts found.');
-      }
-      return;
-    }
-
     // Find the next available minion bot
     const availableMinion = minionBots.find((minion) => minion.isActive && !minion.isInUse);
 
@@ -427,20 +412,16 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
     }
 
     availableMinion.isInUse = true;
-    const coverImageUrl = `http://${coverArtAddress}:${coverArtPort}/images/${path.basename(coverImagePath)}`;
 
-    // Prepare the data to send to the minion bot
+    // Prepare the basic playback data to send to the minion bot
     const playbackData = {
       userID: userId,
       audiobookTitle: selectedAudiobook,
-      chapterParts: initialChapterParts,
       currentPart: currentPart,
       currentChapter: currentChapter,
       currentTimestamp: currentTimestamp,
       channelID: interaction.channel.id,
       guildID: interaction.guild.id,
-      coverImageUrl: coverImageUrl || null,
-      author: metadata.author || 'Unknown Author',
     };
 
     // Send the interaction to the minion bot
@@ -454,7 +435,7 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
 
     // Notify the user that playback has started
     if (!interaction.replied) {
-      await interaction.followUp(`Now playing: **${selectedAudiobook}** (Chapter ${currentChapter}, Part ${currentPart + 1})`);
+      await interaction.followUp(`Now playing: **${selectedAudiobook}**`);
     }
   } catch (error) {
     console.error('Error executing audiobook command:', error);
@@ -531,7 +512,7 @@ function checkAndMountNetworkDrive() {
 
 function sendStreamPAlToClientVoiceChannel() {
   setTimeout(function(){
-    axios.post('http://' + ipAddress + ':' + piServicePort + '/join_channel') 
+    axios.post('http://' + mediaPIIPAddress + ':' + piServicePort + '/join_channel') 
     .then(response => {
       console.log('Post request /join_channel sent\n' + response.data);
     })
@@ -543,7 +524,7 @@ function sendStreamPAlToClientVoiceChannel() {
 
 function startLiveStreamService() {
   setTimeout(function(){
-    axios.post('http://' + ipAddress + ':' + piServicePort + '/start_livestream_service') 
+    axios.post('http://' + mediaPIIPAddress + ':' + piServicePort + '/start_livestream_service') 
     .then(response => {
       console.log('Post request /start_livestream_service sent\n' + response.data);
     })
@@ -559,27 +540,37 @@ function getNextAvailableMinion() {
 }
 
 minionBots.forEach((minion) => {
-  // Fork a new process for each minion bot
-  const minionProcess = fork(
-    path.join(__dirname, 'utils', 'minionBot.js'),
-    [minion.id, minion.token],
-    { stdio: 'inherit' }
-  );
-  console.log('spawning minion bot with id and token ' + minion.id + ' ' + minion.token);
-  // Mark the minion as active when the process starts
-  minion.isActive = true;
+  // Function to spawn a minion bot process
+  const spawnMinionBot = (minion) => {
+    const minionProcess = fork(
+      path.join(__dirname, 'utils', 'minionBot.js'),
+      [minion.id, minion.token],
+      { stdio: 'inherit' }
+    );
 
-  // Handle when the minion process exits
-  minionProcess.on('exit', (code) => {
-    console.log(`${minion.id} exited with code ${code}`);
-    minion.isActive = false;
-    minion.isInUse = false;
-    minion.userID = null; // Clear the associated user
-    minionProcesses.delete(minion.id); // Remove the process from the map
-  });
+    console.log('Spawning minion bot with id and token ' + minion.id + ' ' + minion.token);
 
-  // Store the minion process in the map
-  minionProcesses.set(minion.id, minionProcess);
+    // Mark the minion as active when the process starts
+    minion.isActive = true;
+
+    // Handle when the minion process exits
+    minionProcess.on('exit', (code) => {
+      console.log(`${minion.id} exited with code ${code}`);
+      minion.isActive = false;
+      minion.isInUse = false;
+      minion.userID = null; // Clear the associated user
+      minionProcesses.delete(minion.id); // Remove the process from the map
+
+      console.log(`Restarting minion bot ${minion.id}...`);
+      spawnMinionBot(minion); // Restart the minion bot
+    });
+
+    // Store the minion process in the map
+    minionProcesses.set(minion.id, minionProcess);
+  };
+
+  // Spawn the initial minion bot process
+  spawnMinionBot(minion);
 });
 
 masterBot.aliases = new Collection();
