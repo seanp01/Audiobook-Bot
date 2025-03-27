@@ -7,7 +7,7 @@
     "start": "node bot.js"
   },
   "author": "sparkertech",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.18.0",
@@ -27,8 +27,11 @@
     "ascii-table": "0.0.9",
     "colors": "^1.4.0"
   },
-  "version": "1.35.0",
+  "version": "1.38.0",
   "changelog": {
+    "1.38.0": "Removed reference to local machine name. ~ Sean Parker",
+    "1.37.0": "Added 2 more minion bots and a chapter select to the UI playback. ~ Sean Parker",
+    "1.36.0": "Added code to reuse UI Seek playback messages instead of creating new ones when possible. ~ Sean Parker",
     "1.35.0": "Fix for the next and prev chapter bugs. Skip and back 10 second increment commands are still bugged. ~ Sean Parker",
     "1.34.0": "Update for the dvr ffmpeg audiobook service ~ Sean Parker",
     "1.33.0": "Bug fix for resetting the update seek UI flag if an exception is thrown during the update. ~ Sean Parker",

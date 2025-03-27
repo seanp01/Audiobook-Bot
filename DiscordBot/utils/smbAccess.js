@@ -411,10 +411,21 @@ function getUserPosition(userId, audiobookTitle) {
   return null;
 }
 
+let isUpdatingCache = false;
 // Schedule cache updates once a week
 function scheduleCacheUpdates() {
-  console.log('function scheduleCacheUpdates()');
-  setInterval(updateAudiobookCache, CACHE_DURATION);
+  if (isUpdatingCache) {
+    console.log('Cache update already in progress. Skipping this call.');
+    return;
+  }
+  isUpdatingCache = true;
+  try {
+    setInterval(updateAudiobookCache, CACHE_DURATION);
+  } catch (error) {
+    console.error('Error updating audiobook cache');
+  } finally {
+    isUpdatingCache = false;
+  }
 }
 
 

@@ -22,8 +22,13 @@ const streamboiAppID = process.env.STREAMBOI_APP_ID;
 
 const player1ID = process.env.MINION_BOT_1_APP_ID;
 const player2ID = process.env.MINION_BOT_2_APP_ID;
+const player3ID = process.env.MINION_BOT_3_APP_ID;
+const player4ID = process.env.MINION_BOT_4_APP_ID;
+
 const player1Token = process.env.MINION_BOT_1_TOKEN;
 const player2Token = process.env.MINION_BOT_2_TOKEN;
+const player3Token = process.env.MINION_BOT_3_TOKEN;
+const player4Token = process.env.MINION_BOT_4_TOKEN;
 const streamPalToken = process.env.MASTER_BOT_TOKEN;
 
 // Network addresses
@@ -56,6 +61,7 @@ let onlineMembers = [];
 let skipAdjustment = 0;
 
 const userPositionFilePath = path.join(__dirname, 'utils', 'userPosition.json');
+const userMessageMapFilePath = path.join(__dirname, 'utils', 'userMessageMap.json');
 
 const imageHost = express();
 
@@ -114,6 +120,22 @@ const minionBots = [
     isActive: false, // Track whether the minion is active
     isInUse: false, // Track whether the minion is in use
   },
+  {
+    id: 'player3',
+    appId: player3ID,
+    token: player3Token,
+    client: null,
+    isActive: false, // Track whether the minion is active
+    isInUse: false, // Track whether the minion is in use
+  },
+  {
+    id: 'player4',
+    appId: player4ID,
+    token: player4Token,
+    client: null,
+    isActive: false, // Track whether the minion is active
+    isInUse: false, // Track whether the minion is in use
+  }
 ];
 
 // Define the enum for commands
@@ -196,7 +218,7 @@ masterBot.once('ready', async () => {
   // Use the enum for local command values
   const localCommands = new Set(Object.values(Commands));
   // Delete commands that are not found in the folder
-  const rest = new REST({ version: '9' }).setToken(require('./botconfig/config.json').token);
+  const rest = new REST({ version: '9' }).setToken(process.env.MASTER_BOT_TOKEN);
   try {
     console.log('Started deleting extra application (/) commands.');
 
@@ -391,7 +413,6 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
     const selectedChapter = bookTitle ? 1 : (interaction.options.getNumber('chapter') || 1);
     let currentTimestamp = 0;
 
-    // Retrieve user's last played position
     const userPosition = getUserPosition(userId, selectedAudiobook);
     let currentChapter = selectedChapter;
     let currentPart = 0;
@@ -402,7 +423,6 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
       currentPart = userPosition.part;
     }
 
-    // Find the next available minion bot
     const availableMinion = minionBots.find((minion) => minion.isActive && !minion.isInUse);
 
     if (!availableMinion) {
@@ -413,7 +433,6 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
 
     availableMinion.isInUse = true;
 
-    // Prepare the basic playback data to send to the minion bot
     const playbackData = {
       userID: userId,
       audiobookTitle: selectedAudiobook,
@@ -424,16 +443,13 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
       guildID: interaction.guild.id,
     };
 
-    // Send the interaction to the minion bot
     await sendInteractionToMinion(availableMinion, playbackData, 'playback');
 
-    // Update the user's current audiobook state
     userCurrentAudiobook.set(userId, selectedAudiobook);
     userCurrentChapter.set(userId, currentChapter);
     userCurrentPart.set(userId, currentPart);
     userTimestamps.set(userId, currentTimestamp);
 
-    // Notify the user that playback has started
     if (!interaction.replied) {
       await interaction.followUp(`Now playing: **${selectedAudiobook}**`);
     }
@@ -442,10 +458,44 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
     if (!interaction.deferred && !interaction.replied) {
       await interaction.reply('An error occurred while executing the command.');
     }
-    if (!interaction.replied) {
-      await interaction.followUp('An error occurred while executing the command.');
-    }
   }
+}
+
+// Read the JSON file
+function loadUserMessageMap() {
+  try {
+    if (fs.existsSync(userMessageMapFilePath)) {
+      const fileData = fs.readFileSync(userMessageMapFilePath, 'utf8');
+      return JSON.parse(fileData);
+    }
+    return {};
+  } catch (error) {
+    console.error('Error loading user message map:', error);
+    return {};
+  }
+}
+
+// Write to the JSON file
+function saveUserMessageMap(data) {
+  try {
+    fs.writeFileSync(userMessageMapFilePath, JSON.stringify(data, null, 2));
+  } catch (error) {
+    console.error('Error saving user message map:', error);
+  }
+}
+
+// Update the JSON file with a new mapping
+function updateUserMessageMap(userID, channelID, messageID) {
+  const userMessageMap = loadUserMessageMap();
+  userMessageMap[userID] = { channelID, messageID };
+  saveUserMessageMap(userMessageMap);
+}
+
+// Remove a mapping from the JSON file
+function removeUserMessageMap(userID) {
+  const userMessageMap = loadUserMessageMap();
+  delete userMessageMap[userID];
+  saveUserMessageMap(userMessageMap);
 }
 
 function checkAndMountNetworkDrive() {
@@ -540,6 +590,10 @@ function getNextAvailableMinion() {
 }
 
 minionBots.forEach((minion) => {
+  if (minion.token === undefined || minion.token === '') {
+    console.error(`Minion bot ${minion.id} token is not defined.`);
+    return;
+  }
   // Function to spawn a minion bot process
   const spawnMinionBot = (minion) => {
     const minionProcess = fork(

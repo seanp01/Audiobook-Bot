@@ -50,60 +50,83 @@ client.once('ready', () => {
 
 client.on('interactionCreate', async (interaction) => {
   try {
-    // Ensure the interaction is a button interaction
-    if (!interaction.isButton()) return;
+    // Ensure the interaction is a button or select menu interaction
+    if (!interaction.isButton() && !interaction.isStringSelectMenu()) return;
 
-    const command = interaction.customId;
+    if (interaction.isStringSelectMenu()) {
+      const { customId, values } = interaction;
 
-    // Acknowledge the interaction immediately to prevent "This interaction failed" errors
-    if (!interaction.deferred && !interaction.replied) {
-      try {
-        await interaction.deferUpdate(); // Acknowledge the interaction without sending a visible reply
-      } catch (error) {
-        console.error('Error acknowledging interaction');
+      if (customId === 'chapter_select') {
+        const selectedChapter = parseInt(values[0], 10); // Get the selected chapter
+        console.log(`User selected Chapter ${selectedChapter}`);
+
+        // Update playback data and load the selected chapter
+        playbackData.currentChapter = selectedChapter - 1; // Adjust for 0-based index
+        playbackData.currentPart = 0;
+        playbackData.currentTimestamp = 0;
+
+        // Load the selected chapter
+        await loadChapter();
+
+        // Acknowledge the interaction
+        await interaction.reply({ content: `Chapter ${selectedChapter} selected.`, ephemeral: true });
+        return;
       }
     }
 
-    // Handle the button commands
-    switch (command) {
-      case 'play_pause':
-        if (!player) {
-          console.error('Player is not initialized.');
-          return;
+    if (interaction.isButton()) {
+      const command = interaction.customId;
+
+      // Acknowledge the interaction immediately to prevent "This interaction failed" errors
+      if (!interaction.deferred && !interaction.replied) {
+        try {
+          await interaction.deferUpdate(); // Acknowledge the interaction without sending a visible reply
+        } catch (error) {
+          console.error('Error acknowledging interaction');
         }
-        if (player.state.status === AudioPlayerStatus.Playing) {
-          await handlePlaybackControl('pause');
-        } else if (player.state.status === AudioPlayerStatus.Paused) {
-          await handlePlaybackControl('play');
-        }
-        break;
+      }
 
-      case 'skip':
-        await handleSkipCommand();
-        break;
+      // Handle the button commands
+      switch (command) {
+        case 'play_pause':
+          if (!player) {
+            console.error('Player is not initialized.');
+            return;
+          }
+          if (player.state.status === AudioPlayerStatus.Playing) {
+            await handlePlaybackControl('pause');
+          } else if (player.state.status === AudioPlayerStatus.Paused) {
+            await handlePlaybackControl('play');
+          }
+          break;
 
-      case 'back':
-        await handleBackCommand();
-        break;
+        case 'skip':
+          await handleSkipCommand();
+          break;
 
-      case 'next':
-        await handleNextChapterCommand();
-        break;
+        case 'back':
+          await handleBackCommand();
+          break;
 
-      case 'prev':
-        await handlePreviousChapterCommand();
-        break;
+        case 'next':
+          await handleNextChapterCommand();
+          break;
 
-      default:
-        console.error(`Unknown button interaction: ${command}`);
-        break;
+        case 'prev':
+          await handlePreviousChapterCommand();
+          break;
+
+        default:
+          console.error(`Unknown button interaction: ${command}`);
+          break;
+      }
     }
   } catch (error) {
     console.error('Error handling interaction:', error);
 
     // Notify the user if an error occurs
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp();
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'An error occurred while processing your request.', ephemeral: true });
     }
   }
 });
@@ -193,22 +216,21 @@ async function endSession() {
 
     if (connection) {
       console.log('Destroying voice connection...');
-      await new Promise((resolve) => {
-        connection.destroy();
-        resolve(); // Resolve the promise after destroying the connection
-      });
+      connection.destroy();
       connection = null;
       console.log('Voice connection destroyed.');
     }
 
-    console.log('Session ended by the user.');
+    // Pause the UI
+    if (playbackUiMessage) {
+      const embed = playbackUiMessage.embeds[0];
+      const updatedEmbed = EmbedBuilder.from(embed).spliceFields(1, 1, { name: 'Playback State', value: '⏸️ Paused' });
+      await playbackUiMessage.edit({ embeds: [updatedEmbed] });
+    }
 
-    // Trigger process exit to save positions and clean up
-    console.log('Exiting process...');
-    process.exit(0); // Exit the process with a success code
+    console.log('Session ended by the user.');
   } catch (error) {
     console.error('Error ending session:', error);
-    process.exit(1); // Exit the process with an error code
   }
 }
 
@@ -356,43 +378,20 @@ async function updateSeekUI() {
       currentTimestamp = 0,
       coverImageUrl = null,
       author = 'Unknown Author',
+      userID,
+      channelID,
     } = playbackData;
 
-    // Retrieve the cached part durations
     const partDurations = await calculateTotalChapterDuration(playbackData.chapterParts);
 
-    // Check if the current file is a temporary file
-    const currentFilePath = playbackData.chapterParts[currentPart];
-    const originalFilePath = tempToOriginalMap.get(currentFilePath);
-
-    let timeRemovedFromStart = 0;
-
-    if (originalFilePath) {
-      // If the file is a temporary file, calculate the time removed from the start
-      const originalDuration = await getCachedAudioDuration(originalFilePath);
-      const currentDuration = await getCachedAudioDuration(currentFilePath);
-
-      timeRemovedFromStart = originalDuration - currentDuration;
-      console.log(`Time removed from start: ${timeRemovedFromStart} ms`);
-    }
-
-    // Calculate the cumulative duration up to the current part
     const timeToCurrentPart = partDurations.slice(0, currentPart).reduce((sum, duration) => sum + duration, 0);
-
-    // Adjust the total timestamp to account for the time removed
-    const totalTimestamp = currentTimestamp + timeToCurrentPart + timeRemovedFromStart;
-
-    // Calculate the total duration of the chapter
+    const totalTimestamp = currentTimestamp + timeToCurrentPart;
     const totalChapterDuration = partDurations.reduce((sum, duration) => sum + duration, 0);
 
-    // Generate the progress bar
     const progressBar = await createPlaybackSeekbarRow(totalTimestamp, totalChapterDuration);
-
-    // Format the playback state
     const isPlaying = player && player.state.status === AudioPlayerStatus.Playing;
     const playbackState = isPlaying ? '▶️ Playing' : '⏸️ Paused';
 
-    // Create the embed for the UI
     const embed = new EmbedBuilder()
       .setTitle(audiobookTitle)
       .setAuthor({ name: author })
@@ -405,7 +404,6 @@ async function updateSeekUI() {
       )
       .setColor('#0099ff');
 
-    // Only set the thumbnail if the coverImageUrl is valid
     if (coverImageUrl) {
       embed.setThumbnail(coverImageUrl);
     }
@@ -435,20 +433,47 @@ async function updateSeekUI() {
           .setStyle(ButtonStyle.Secondary)
       );
 
-    // Send or edit the playback UI message
-    const channel = client.channels.cache.get(playbackData.channelID);
+    // Create the chapter selection dropdown
+    const chapters = Array.from({ length: 20 }, (_, i) => ({
+      label: `Chapter ${i + 1}`,
+      value: `${i + 1}`,
+    })); // Example: Replace with actual chapter data
+
+    const chapterSelect = new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('chapter_select')
+        .setPlaceholder('Select a Chapter')
+        .addOptions(chapters)
+    );
+
+    const userMessageMap = loadUserMessageMap();
+    const userMessageData = userMessageMap[userID];
+    const channel = client.channels.cache.get(channelID);
+
     if (!channel) {
-      console.error(`Channel with ID ${playbackData.channelID} not found.`);
+      console.error(`Channel with ID ${channelID} not found.`);
       return;
     }
 
-    if (!playbackUiMessage) {
-      // Send a new message if no playback UI message exists
-      playbackUiMessage = await channel.send({ embeds: [embed], components: [row] });
-    } else {
-      // Edit the existing playback UI message
-      await playbackUiMessage.edit({ embeds: [embed], components: [row] });
+    if (userMessageData && userMessageData.channelID === channelID) {
+      // Reuse the existing message
+      const message = await channel.messages.fetch(userMessageData.messageID).catch(() => null);
+      if (message) {
+        await message.edit({ embeds: [embed], components: [row, chapterSelect] });
+        playbackUiMessage = message; // Update the reference
+        return;
+      } else {
+        // If the message no longer exists, remove it from the map
+        removeUserMessageMap(userID);
+      }
     }
+
+    // Send a new message if no existing message is found
+    const newMessage = await channel.send({ embeds: [embed], components: [row, chapterSelect] });
+    playbackUiMessage = newMessage;
+
+    // Update the user message map
+    updateUserMessageMap(userID, channelID, newMessage.id);
   } catch (error) {
     console.error('Error updating seek UI:', error);
   } finally {
