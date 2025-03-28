@@ -242,9 +242,10 @@ masterBot.once('ready', async () => {
 
   // Register (or update) new commands
   const commandsToRegister = [
-      // new SlashCommandBuilder().setName(Commands.AUDIOBOOK).setDescription('Plays an audiobook selection')
-      //    .addStringOption(option => option.setName('title').setDescription('Name of audiobook to play').setRequired(true))
-      //    .addNumberOption(option => option.setName('chapter').setDescription('Chapter to start from').setRequired(false)),
+       new SlashCommandBuilder().setName(Commands.AUDIOBOOK).setDescription('Plays an audiobook selection')
+          .addStringOption(option => option.setName('title').setDescription('Name of audiobook to play').setRequired(true))
+          .addNumberOption(option => option.setName('chapter').setDescription('Chapter to start from').setRequired(false)),
+        new SlashCommandBuilder().setName(Commands.AUDIOBOOK_IN_PROGRESS).setDescription('Lists audiobooks in progress'),
     ];
 
    for (const command of commandsToRegister) {
@@ -328,7 +329,9 @@ masterBot.on('interactionCreate', async (interaction) => {
 
       if (command.startsWith('resume_')) {
         const bookTitle = command.replace('resume_', '');
-        await interaction.deferReply({ ephemeral: true }); // Defer the reply to acknowledge the interaction
+        await interaction.deferUpdate(); // Defer the reply to acknowledge the interaction
+      
+        // Execute the audiobook command to start a new session
         await executeAudiobookCommand(interaction, bookTitle);
       }
     }

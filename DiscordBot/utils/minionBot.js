@@ -1,5 +1,5 @@
 const { getUserBooksInProgress, loadUserPositions, scheduleUserPositionSaving, listAudiobooks, getM4BCoverImage, getM4BMetaData, findClosestMatch, getFileNameFromTitle, skipAudiobook, retrieveAudiobookFilePaths, selectAudiobookAndRetrievePaths, updateAudiobookCache, storeUserPosition, getUserPosition, } = require('./smbAccess');
-const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
+const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, getVoiceConnection, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const { v4: uuidv4 } = require('uuid');
 require('@discordjs/opus');
@@ -32,6 +32,7 @@ let storeInterval = null;
 let updateInterval = null;
 let guild = null;
 let playbackUiMessage = null; 
+let currentAudiobook = null;
 
 let initialTimestamp = 0;
 let initialPartIndex = 0;
@@ -89,17 +90,142 @@ client.on('interactionCreate', async (interaction) => {
       // Handle the button commands
       switch (command) {
         case 'play_pause':
-          if (!player) {
-            console.error('Player is not initialized.');
-            return;
-          }
-          if (player.state.status === AudioPlayerStatus.Playing) {
-            await handlePlaybackControl('pause');
-          } else if (player.state.status === AudioPlayerStatus.Paused) {
-            await handlePlaybackControl('play');
+          try {
+            console.log('Handling play_pause interaction.');
+        
+            // Check if the playback UI message is in memory
+            const isMessageInMemory = playbackUiMessage && playbackUiMessage.id === interaction.message.id;
+        
+            // Check if the player exists
+            let isPlayerActive = false;
+            if (player) {
+              isPlayerActive = player.state.status !== AudioPlayerStatus.AutoPaused;
+              if (!isPlayerActive) {
+                player = null;
+              }
+            }
+        
+            if (isMessageInMemory && isPlayerActive) {
+              console.log('Message is in memory and player exists. Resuming playback.');
+              // Resume playback
+              if (player.state.status === AudioPlayerStatus.Playing) {
+                await handlePlaybackControl('pause');
+                await updateSeekUI(); // Update the UI after pausing
+              } else if (player.state.status === AudioPlayerStatus.Paused) {
+                await handlePlaybackControl('play');
+                await updateSeekUI(); // Update the UI after pausing
+              }
+              return;
+            }
+            console.log('Message not in memory or player does not exist. Creating a new session.');
+        
+            // Extract metadata from the seek UI message
+            const embed = interaction.message.embeds[0];
+            currentAudiobook = embed.title; // Extract the book title from the embed
+            const userPosition = getUserPosition(interaction.user.id, currentAudiobook);
+
+            // Delete the old message if it exists
+            try {
+              console.log('Deleting the old message.');
+              await interaction.message.delete();
+            } catch (error) {
+              console.error('Error deleting the old message:', error);
+            }
+        
+            let currentChapter = 0;
+            let currentPart = 0;
+            let currentTimestamp = 0;
+        
+            if (userPosition) {
+              currentTimestamp = userPosition.timestamp;
+              currentChapter = userPosition.chapter;
+              currentPart = userPosition.part;
+            }
+        
+            // Reconstruct playbackData
+            playbackData = {
+              userID: interaction.user.id,
+              channelID: interaction.channel.id,
+              guildID: interaction.guild.id,
+              audiobookTitle: currentAudiobook,
+              currentChapter: currentChapter,
+              currentPart: currentPart,
+              currentTimestamp: currentTimestamp, // Default to 0 if not stored in the embed
+              chapterParts: [], // This will be populated later
+              coverImageUrl: embed.thumbnail?.url || null,
+              author: embed.author?.name || 'Unknown Author',
+            };
+        
+            // Retrieve audiobook parts and metadata
+            const { outputPaths: chapterParts, metadata, coverImagePath } = await selectAudiobookAndRetrievePaths(
+              currentAudiobook,
+              playbackData.currentChapter,
+              playbackData.currentPart,
+              playbackData.currentTimestamp
+            );
+        
+            if (!chapterParts || chapterParts.length === 0) {
+              console.error('Error: No parts found.');
+              return;
+            }
+        
+            playbackData.chapterParts = chapterParts;
+            playbackData.coverImageUrl = getDynamicCoverImageUrl(coverImagePath);
+            playbackData.author = metadata.author || 'Unknown Author';
+        
+            // Create a new player and start playback
+            createPlayer();
+            await startPlayback();
+        
+            // Create a new playback UI message
+            const embedBuilder = new EmbedBuilder()
+              .setTitle(currentAudiobook)
+              .setAuthor({ name: playbackData.author })
+              .setDescription(`Chapter: ${currentChapter + 1} | Part: ${currentPart + 1}`)
+              .setColor('#0099ff');
+        
+            if (playbackData.coverImageUrl) {
+              embedBuilder.setThumbnail(playbackData.coverImageUrl);
+            }
+        
+            const row = new ActionRowBuilder()
+              .addComponents(
+                new ButtonBuilder()
+                  .setCustomId('prev')
+                  .setLabel('⏮️ Previous')
+                  .setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder()
+                  .setCustomId('back')
+                  .setLabel('↩️ Rewind')
+                  .setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder()
+                  .setCustomId('play_pause')
+                  .setLabel('⏸️ Pause')
+                  .setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder()
+                  .setCustomId('skip')
+                  .setLabel('↪️ Skip')
+                  .setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder()
+                  .setCustomId('next')
+                  .setLabel('⏭️ Next')
+                  .setStyle(ButtonStyle.Secondary)
+              );
+        
+            const channel = client.channels.cache.get(playbackData.channelID);
+            if (!channel) {
+              console.error(`Channel with ID ${playbackData.channelID} not found.`);
+              return;
+            }
+        
+            const newMessage = await channel.send({ embeds: [embedBuilder], components: [row] });
+            playbackUiMessage = newMessage;
+        
+            console.log('New playback session created.');
+          } catch (error) {
+            console.error('Error handling play_pause button:', error);
           }
           break;
-
         case 'skip':
           await handleSkipCommand();
           break;
@@ -123,11 +249,6 @@ client.on('interactionCreate', async (interaction) => {
     }
   } catch (error) {
     console.error('Error handling interaction:', error);
-
-    // Notify the user if an error occurs
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: 'An error occurred while processing your request.', ephemeral: true });
-    }
   }
 });
 
@@ -138,10 +259,12 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   const channelID = playbackData.channelID;
 
   // Check if the user left the voice channel
-  if (oldState.channelId === channelID && newState.channelId !== channelID) {
+  if (oldState.channelId === channelID && newState.channelId !== channelID && userID === newState.user.id) {
     console.log(`User ${userID} left the voice channel. Ending session.`);
     endSession();
     clearInterval(updateInterval);
+    player.stop(); // Stop playback
+    player = null; // Clear the player reference
   }
 });
 
@@ -151,7 +274,7 @@ process.on('message', async (message) => {
     switch (message.type) {
       case 'playback':
         playbackData = message.data;
-
+        currentAudiobook = playbackData.audiobookTitle; // Store the audiobook title
         // Retrieve audiobook parts and metadata
         const { outputPaths: chapterParts, originalFilePath, metadata, coverImagePath } = await selectAudiobookAndRetrievePaths(
           playbackData.audiobookTitle,
@@ -182,7 +305,7 @@ process.on('message', async (message) => {
   }
 });
 
-process.on('exit', () => {
+process.on('exit', async () => {
   if (storeInterval) clearInterval(storeInterval);
   if (updateInterval) clearInterval(updateInterval);
   if (connection) {
@@ -193,6 +316,14 @@ process.on('exit', () => {
   // Sync positions to file before exiting
   syncPositionsToFile();
   console.log('User positions saved to file before exiting.');
+
+  if (playbackUiMessage) {
+    if (player) player.pause();
+    await updateSeekUI(); // Update the UI before exiting
+    player.stop(); // Stop playback
+    player = null;
+  }
+
   clearTempFiles();
   console.log('Minion bot process exiting. Cleaned up resources.');
 });
@@ -207,6 +338,8 @@ process.on('unhandledRejection', (reason, promise) => {
 
 async function endSession() {
   try {
+    player.pause(); // Pause playback
+    await updateSeekUI();
     if (player) {
       player.stop(); // Stop playback
       console.log('Playback stopped.');
@@ -220,14 +353,6 @@ async function endSession() {
       connection = null;
       console.log('Voice connection destroyed.');
     }
-
-    // Pause the UI
-    if (playbackUiMessage) {
-      const embed = playbackUiMessage.embeds[0];
-      const updatedEmbed = EmbedBuilder.from(embed).spliceFields(1, 1, { name: 'Playback State', value: '⏸️ Paused' });
-      await playbackUiMessage.edit({ embeds: [updatedEmbed] });
-    }
-
     console.log('Session ended by the user.');
   } catch (error) {
     console.error('Error ending session:', error);
@@ -266,7 +391,7 @@ async function startPlayback() {
 
     // Subscribe the player to the connection
     connection.subscribe(player);
-
+    await updateSeekUI();
     console.log(`Playing part ${currentPart + 1} of chapter ${playbackData.currentChapter}.`);
   } catch (error) {
     console.error('Error starting playback:', error);
@@ -364,7 +489,8 @@ async function handleNextPart() {
 }
 
 async function updateSeekUI() {
-  if (isUpdatingSeekUI) {
+  if (isUpdatingSeekUI || !playbackData) {
+    console.log('updateSeekUI: Skipping execution as it is already running or playbackData is null.');
     return; // Exit if the function is already running
   }
 
@@ -378,12 +504,12 @@ async function updateSeekUI() {
       currentTimestamp = 0,
       coverImageUrl = null,
       author = 'Unknown Author',
-      userID,
       channelID,
     } = playbackData;
 
-    const partDurations = await calculateTotalChapterDuration(playbackData.chapterParts);
+    if (!audiobookTitle || audiobookTitle === 'Unknown Title') return;
 
+    const partDurations = await calculateTotalChapterDuration(playbackData.chapterParts);
     const timeToCurrentPart = partDurations.slice(0, currentPart).reduce((sum, duration) => sum + duration, 0);
     const totalTimestamp = currentTimestamp + timeToCurrentPart;
     const totalChapterDuration = partDurations.reduce((sum, duration) => sum + duration, 0);
@@ -408,7 +534,17 @@ async function updateSeekUI() {
       embed.setThumbnail(coverImageUrl);
     }
 
-    // Create the action rows for controls
+    // Create the chapter selection dropdown
+    const chapters = Array.from({ length: 20 }, (_, i) => ({
+      label: `Chapter ${i + 1}`,
+      value: `${i + 1}`,
+    })); // Example: Replace with actual chapter data
+
+    const chapterSelect = new StringSelectMenuBuilder()
+        .setCustomId('chapter_select')
+        .setPlaceholder('Select a Chapter')
+        .addOptions(chapters);
+
     const row = new ActionRowBuilder()
       .addComponents(
         new ButtonBuilder()
@@ -433,49 +569,35 @@ async function updateSeekUI() {
           .setStyle(ButtonStyle.Secondary)
       );
 
-    // Create the chapter selection dropdown
-    const chapters = Array.from({ length: 20 }, (_, i) => ({
-      label: `Chapter ${i + 1}`,
-      value: `${i + 1}`,
-    })); // Example: Replace with actual chapter data
+    const chapterRow = new ActionRowBuilder().addComponents(chapterSelect);
 
-    const chapterSelect = new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId('chapter_select')
-        .setPlaceholder('Select a Chapter')
-        .addOptions(chapters)
-    );
-
-    const userMessageMap = loadUserMessageMap();
-    const userMessageData = userMessageMap[userID];
     const channel = client.channels.cache.get(channelID);
-
     if (!channel) {
-      console.error(`Channel with ID ${channelID} not found.`);
+      console.error(`updateSeekUI: Channel with ID ${channelID} not found.`);
       return;
     }
 
-    if (userMessageData && userMessageData.channelID === channelID) {
-      // Reuse the existing message
-      const message = await channel.messages.fetch(userMessageData.messageID).catch(() => null);
-      if (message) {
-        await message.edit({ embeds: [embed], components: [row, chapterSelect] });
-        playbackUiMessage = message; // Update the reference
-        return;
-      } else {
-        // If the message no longer exists, remove it from the map
-        removeUserMessageMap(userID);
+    if (playbackUiMessage) {
+      try {
+        const message = await channel.messages.fetch(playbackUiMessage.id).catch(() => null);
+
+        if (message) {
+          await message.edit({ embeds: [embed], components: [row, chapterRow] });
+          return;
+        } else {
+          console.log('updateSeekUI: Message not found. Creating a new one.');
+        }
+      } catch (error) {
+        console.error('updateSeekUI: Error fetching or editing message:', error);
       }
     }
 
-    // Send a new message if no existing message is found
-    const newMessage = await channel.send({ embeds: [embed], components: [row, chapterSelect] });
+    const newMessage = await channel.send({ embeds: [embed], components: [row, chapterRow] });
     playbackUiMessage = newMessage;
 
-    // Update the user message map
-    updateUserMessageMap(userID, channelID, newMessage.id);
+    console.log('updateSeekUI: New playback UI message created.');
   } catch (error) {
-    console.error('Error updating seek UI:', error);
+    console.error('updateSeekUI: Error occurred:', error);
   } finally {
     isUpdatingSeekUI = false; // Release the lock
   }
@@ -636,7 +758,7 @@ async function handleNextChapterCommand() {
     }
 
     playbackData.chapterParts = chapterParts;
-
+    syncPositionsToFile()
     console.log(`Loaded chapter ${playbackData.currentChapter}.`);
     await startPlayback(); // Start playback for the new chapter
   } catch (error) {
@@ -669,7 +791,7 @@ async function handlePreviousChapterCommand() {
     }
 
     playbackData.chapterParts = chapterParts;
-
+    syncPositionsToFile()
     console.log(`Loaded chapter ${playbackData.currentChapter}.`);
     await startPlayback(); // Start playback for the new chapter
   } catch (error) {
@@ -875,12 +997,26 @@ async function handlePlaybackControl(command) {
 
 function syncPositionsToFile() {
   try {
+    console.log('syncPositionsToFile: Starting sync process.');
+
     let existingData = {};
 
     // Read the existing file data if it exists
     if (fs.existsSync(userPositionFilePath)) {
       const fileData = fs.readFileSync(userPositionFilePath, 'utf-8');
-      existingData = JSON.parse(fileData);
+      if (fileData.trim()) {
+        try {
+          existingData = JSON.parse(fileData);
+          console.log('syncPositionsToFile: Successfully loaded existing data.');
+        } catch (error) {
+          console.error('syncPositionsToFile: Error parsing existing JSON file. Resetting to an empty object.', error);
+          existingData = {}; // Reset to an empty object if the file is invalid
+        }
+      } else {
+        console.log('syncPositionsToFile: File is empty. Initializing with an empty object.');
+      }
+    } else {
+      console.log('syncPositionsToFile: File does not exist. Creating a new one.');
     }
 
     // Merge the cached data with the existing data
@@ -889,16 +1025,23 @@ function syncPositionsToFile() {
         existingData[userID] = {}; // Initialize the user's data if it doesn't exist
       }
 
-      // Update the user's audiobooks
+      // Validate and update the user's audiobooks
       for (const [audiobookTitle, positionData] of Object.entries(userAudiobooks)) {
+        if (!audiobookTitle || audiobookTitle === 'undefined' || typeof audiobookTitle !== 'string') {
+          console.warn(`syncPositionsToFile: Skipping invalid audiobook title for user ${userID}:`, audiobookTitle);
+          continue; // Skip invalid titles
+        }
+
         existingData[userID][audiobookTitle] = positionData;
+        console.log(`syncPositionsToFile: Updated position for user ${userID}, audiobook "${audiobookTitle}".`);
       }
     }
 
     // Write the updated data back to the file
     fs.writeFileSync(userPositionFilePath, JSON.stringify(existingData, null, 2));
+    console.log('syncPositionsToFile: Successfully synced positions to file.');
   } catch (error) {
-    console.error('Error syncing positions to file:', error);
+    console.error('syncPositionsToFile: Error syncing positions to file:', error);
   }
 }
 
@@ -954,7 +1097,6 @@ function createPlayer() {
     
       try {
         console.log('Playback started.');    
-        // Add your logic here (e.g., updating UI, logging, etc.)
         await updateSeekUI(); // Example: Update the seek UI
       } catch (error) {
         console.error('Error handling AudioPlayerStatus.Playing event:', error);

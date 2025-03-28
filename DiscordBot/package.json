@@ -27,8 +27,12 @@
     "ascii-table": "0.0.9",
     "colors": "^1.4.0"
   },
-  "version": "1.38.0",
+  "version": "1.42.0",
   "changelog": {
+    "1.42.0": "Fixes for bugs and introduction of a stable playback UI that can be used to resume a playback of a book. ~ Sean Parker",
+    "1.41.0": "Fixes for bugs introduced in the last update. ~ Sean Parker",
+    "1.40.0": "Modified minion bot script to reuse messages when possible for users. Still buggy when trying to resume playback. ~ Sean Parker",
+    "1.39.0": "Fix for the case sensitivity for title matches to user positions. ~ Sean Parker",
     "1.38.0": "Removed reference to local machine name. ~ Sean Parker",
     "1.37.0": "Added 2 more minion bots and a chapter select to the UI playback. ~ Sean Parker",
     "1.36.0": "Added code to reuse UI Seek playback messages instead of creating new ones when possible. ~ Sean Parker",

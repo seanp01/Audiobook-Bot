@@ -292,7 +292,7 @@ function getUserBooksInProgress(userId) {
     return [];
   }
   return Object.keys(userPositionsCache[userId]).map(title => ({
-    title,
+    title: title.toLowerCase(), // Normalize title to lowercase
     ...userPositionsCache[userId][title]
   }));
 }
@@ -313,9 +313,15 @@ function loadUserPositions() {
 
 // Store user's last played timestamp in memory
 function storeUserPosition(userId, audiobookTitle, chapter, part, timestamp, interaction) {
+  if (!audiobookTitle || typeof audiobookTitle !== 'string') {
+    console.error('Invalid audiobook title:', audiobookTitle);
+    return; // Skip storing the position if the title is invalid
+  }
+
   if (!userPositionsCache[userId]) {
     userPositionsCache[userId] = {};
   }
+
   userPositionsCache[userId][audiobookTitle] = { chapter, part, timestamp };
 }
 
