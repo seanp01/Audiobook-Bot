@@ -25,10 +25,74 @@ The repository consists of the following key services and modules:
   - Multi-user support with isolated playback sessions.
   - Integration with SMB shares for accessing media files.
 
+---
+
+## **Features**
+- **Multi-User Playback:**
+  - Supports multiple users with isolated playback sessions.
+  - Each user can control their own playback without interfering with others.
+
+- **Discord Integration:**
+  - Playback controls and updates directly in Discord chat.
+  - Dynamic UI elements like seek bars and playback state indicators.
+
+- **Media Processing:**
+  - Efficient audio processing using FFmpeg.
+  - Support for SMB shares to access media files across platforms.
+
+- **Cross-Platform Support:**
+  - Designed to run on both Windows and Linux (including Raspberry Pi).
+
+- **Scalability:**
+  - Modular architecture allows for easy addition of new minion bots and services.
+
 
 ---
 
 ## **License**
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+This project is licensed under the ISC License. See the `LICENSE` file for details.
 
 ---
+
+## **Audiobook Bot Features**
+
+#### Browse Catalog
+<img src="./gifs/Browse%20All.gif" alt="Browse All Audiobooks" width="150"/>
+
+---
+
+#### Browse Genres or Authors
+<img src="./gifs/Genres.gif" alt="Browse Genres or Authors" width="150"/>
+
+---
+
+#### View Listens with Progress
+<img src="./gifs/In%20Progress.gif" alt="View Listens" width="150"/>
+
+---
+
+#### Quickly View Listens
+<img src="./gifs/In%20Progress%20Quick.gif" alt="Quickly View Listens" width="150"/>
+
+---
+
+#### Resume Pevious Session
+<img src="./gifs/Resume%20Prev.gif" alt="Resume Listen Session" width="150"/>
+
+---
+
+#### Search for Titles
+<img src="./gifs/Search.gif" alt="Search" width="150"/>
+
+---
+
+#### Playback Controls
+<img src="./gifs/Skips.gif" alt="Skips" width="150"/>
+
+---
+
+#### Seek to Timestamp
+<img src="./gifs/SeekTo.gif" alt="Skips" width="150"/>
+
+
+

@@ -1,2 +1,6 @@
 node_modules
+/DiscordBot/.env/
 /DiscordBot/temp/
+/DiscordBot/utils/userPosition.json
+/DiscordBot/utils/audiobookCache.json
+/DiscordBot/utils/userMessageMap.json

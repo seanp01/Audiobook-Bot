@@ -5,13 +5,24 @@ const fuzzball = require('fuzzball');
 const { exec, spawn, execFile } = require('child_process');
 const { v4: uuidv4 } = require('uuid'); // Import uuid
 const { createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+const axios = require('axios');
+
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') }); // Explicitly load .env from the DiscordBot directory
 
+const dvrAddress = process.env.DVR_ADDRESS;
+const dvrPort = process.env.DVR_PORT;
 const cacheFilePath = path.join(__dirname, 'audiobookCache.json');
 const userPositionFilePath = path.join(__dirname, 'userPosition.json');
 const localOutputDir = path.join(__dirname, '../temp'); // Define local directory
+const localDriveLetter = process.env.LOCAL_DRIVE_LETTER || 'C:'; // Local drive letter for the host PC
+const remoteDriveLetter = process.env.REMOTE_DRIVE_LETTER || 'Z:'; // Remote drive letter for the DVR
+const platform = os.platform();
+const baseDir = platform === 'win32' 
+? `${remoteDriveLetter}` // Windows UNC path
+: '/mnt/audiobooks'; // Linux mount point
+const hostServiceUrl = `http://${dvrAddress}:${dvrPort}`;
 
-let cachedAudiobooks = [];
+let cachedAudiobooks = null;
 let titleToFileMap = {};
 let cacheTimestamp = 0;
 // In-memory cache for user positions
@@ -19,13 +30,7 @@ let userPositionsCache = {};
 const CACHE_DURATION = 7 * 24 * 60 * 60 * 1000; // 1 week
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
-const axios = require('axios');
-const dvrAddress = process.env.DVR_ADDRESS;
-const dvrPort = process.env.DVR_PORT;
-const hostServiceUrl = `http://${dvrAddress}:${dvrPort}`;
-const dvrDeviceName = process.env.DVR_DEVICE_NAME;
-
-const tempToOriginalMap = new Map(); // Map temporary file paths to original file paths
+const tempFilenameToOriginalMap = new Map(); // Map temporary files to original files
 
 // Ensure the local output directory exists
 if (!fs.existsSync(localOutputDir)) {
@@ -39,7 +44,6 @@ function loadCache() {
     cachedAudiobooks = cacheData.cachedAudiobooks;
     titleToFileMap = cacheData.titleToFileMap;
     cacheTimestamp = cacheData.cacheTimestamp;
-    console.log('Cache loaded from file');
   }
 }
 
@@ -59,29 +63,21 @@ async function listAudiobooks() {
     const response = await axios.get(`${hostServiceUrl}/audiobooks`);
     return response.data;
   } catch (error) {
-    console.error('Error listing audiobooks:', error);
+    console.error('Error listing audiobooks');
     throw error;
   }
 }
 
-async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime = 0, duration = MAX_FILE_SIZE) {
-  const platform = os.platform();
-  const baseDir = platform === 'win32' 
-    ? `\\\\${dvrDeviceName}\\Audiobooks` // Windows UNC path
-    : '/mnt/audiobooks'; // Linux mount point
-
+async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime = 0, speed = 1) {
+  fileName = path.basename(path.normalize(fileName)); // Get the file name without the path
   const audiobookDir = path.join(baseDir, fileName.split('.')[0]);
-
-  console.log('Current working directory:', process.cwd());
-  console.log('Reading directory:', audiobookDir);
+  const localAudiobookDir = path.join(localDriveLetter, 'Audiobooks', fileName.split('.')[0]);
 
   try {
     // Check if the directory exists
     if (!fs.existsSync(audiobookDir)) {
       throw new Error(`Directory does not exist: ${audiobookDir}`);
     }
-
-    console.log(`Directory exists: ${audiobookDir}`);
 
     const files = await fs.promises.readdir(audiobookDir);
 
@@ -103,90 +99,98 @@ async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime
       });
 
     // Filter files by chapter and part if specified
-    const chapterFiles = chapter
+    let chapterFiles = chapter
       ? sortedFiles.filter(file => new RegExp(`^Chapter_${chapter}(?:-|\\D|$)`).test(file))
       : sortedFiles;
 
-    // Calculate the total size and select files within the duration limit
-    let totalSize = 0;
-    const selectedFiles = [];
-    for (const file of chapterFiles) {
-      const filePath = path.join(audiobookDir, file);
-      const stats = await fs.promises.stat(filePath);
-      totalSize += stats.size;
-      selectedFiles.push(filePath);
+    if (chapterFiles.length === 0) {
+      console.error(`No files found for chapter ${chapter} trying the next chapter`);
+      return [];
     }
-
-    let originalFilePath = null;
-
-    // If a startTime is provided, use ffmpeg to copy the mp3 locally starting at the desired timestamp
-    if (startTime > 0 && selectedFiles.length > 0) {
-      const uniqueFileName = `${uuidv4()}.mp3`; // Generate a unique filename
-      const localFilePath = path.join(localOutputDir, uniqueFileName);
-      return new Promise((resolve, reject) => {
-        const ffmpeg = spawn("ffmpeg", [
-          "-loglevel", "error", // Suppress extra logs, show only errors
-          "-ss", startTime / 1000,
-          "-i", selectedFiles[part], // Use the first selected file
-          "-vn",
-          "-b:a", "192k",
-          "-c:a", "copy",
-          localFilePath
-        ]);
-
-        ffmpeg.stdout.on("data", (data) => {
-          console.log(`stdout: ${data}`);
-        });
-
-        ffmpeg.stderr.on("data", (data) => {
-          console.error(`stderr: ${data}`);
-        });
-
-        ffmpeg.on("close", (code) => {
-          console.log(`FFmpeg exited with code ${code}`);
-          if (code === 0) {
-            // Map the temporary file to the original file
-            tempToOriginalMap.set(localFilePath, selectedFiles[part]);
-            originalFilePath = selectedFiles[part]; // Store the original file path
-            selectedFiles[part] = localFilePath;
-            resolve({ outputPaths: selectedFiles, originalFilePath }); // Include the original file path
-          } else {
-            reject(new Error(`FFmpeg exited with code ${code}`));
-          }
-        });
+    const chapterFile = chapterFiles.length > 1 ? chapterFiles[part] : chapterFiles[0];
+    const originalFilePath = chapterFile;
+    if (startTime > 0) {
+            // Use the /process endpoint to generate the temp file
+      const response = await axios.post(`${hostServiceUrl}/process`, {
+        filePath: path.join(fileName.split('.')[0], path.basename(path.normalize(chapterFile))),
+        startTime,
+        speed,
+        action: 'seek', // Default action is 'seek'
       });
-    } else {
-      return { outputPaths: selectedFiles, originalFilePath: null }; // No replacement, originalFilePath is null
+
+      const tempFileName = path.basename(path.normalize(response.data.tempFilePath));
+      //const tempFilePath = path.join(localDriveLetter, 'Audiobooks', 'temp', tempFileName); 
+      // Map the temp file to the original file
+      tempFilenameToOriginalMap.set(tempFileName, chapterFile);
+      chapterFiles[part] = tempFileName; // Update the file path to the temp file
     }
+
+    return { outputPaths: chapterFiles, originalFilePath };
   } catch (error) {
-    console.error('Error retrieving audiobook file paths:', error);
+    console.error('Error retrieving audiobook file paths');
     throw error;
   }
 }
+// Define a cache for metadata and cover image paths
+const metaDataCacheMap = new Map();
 
-async function selectAudiobookAndRetrievePaths(userInput, chapter = 0, part = 0, timestamp = 0) {
-  const baseDir = os.platform() === 'win32' ? `\\\\${dvrDeviceName}\\Audiobooks` : '/mnt/audiobooks';
-  console.log('function selectAudiobook()');
+async function selectAudiobookAndRetrievePaths(userInput, chapter, part = 0, timestamp = 0, speed = 1) {
   try {
+    // Find the closest matching audiobook file
+    const fileName = path.basename(await findClosestMatch(userInput));
+    if (!fileName) {
+      throw new Error(`No matching audiobook found for input: ${userInput}`);
+    }
+
     // Update the cache if it's expired
     if (Date.now() - cacheTimestamp > CACHE_DURATION) {
       await updateAudiobookCache();
+      cacheTimestamp = Date.now(); // Update the cache timestamp
+      saveCache();
     }
 
-    const closestMatch = findClosestMatch(userInput);
-    if (!closestMatch) {
-      throw new Error('No matching audiobook found');
+    // Check if the fileName is already cached
+    if (metaDataCacheMap.has(fileName)) {
+      const cachedData = metaDataCacheMap.get(fileName);
+      let { outputPaths, originalFilePath } = await retrieveAudiobookFilePaths(fileName, chapter, part, timestamp, speed);
+      return {
+        outputPaths,
+        originalFilePath: originalFilePath,
+        metadata: cachedData.metadata,
+        coverImagePath: path.basename(path.normalize(cachedData.coverImagePath)),
+      };
     }
-    console.log('Closest match:', closestMatch);
-    const fileName = titleToFileMap[closestMatch];
-    const { outputPaths, originalFilePath } = await retrieveAudiobookFilePaths(fileName, chapter, part, timestamp);
 
-    // Extract metadata and cover image
-    const metadata = await getM4BMetadata(path.join(baseDir, fileName));
-    const coverImagePath = await getM4BCoverImage(path.join(baseDir, fileName));
-    return { outputPaths, originalFilePath, metadata, coverImagePath }; // Include the original file path
+    // Fetch metadata from the /metadata endpoint
+    const metadataResponse = await axios.post(`${hostServiceUrl}/metadata`, {
+      filePath: fileName,
+    });
+    const metadata = metadataResponse.data;
+
+    // Fetch cover image from the /cover endpoint
+    const coverResponse = await axios.post(`${hostServiceUrl}/cover`, {
+      filePath: fileName,
+    });
+    const coverImagePath = coverResponse.data.coverImagePath;
+
+    // Retrieve audiobook file paths
+    let { outputPaths, originalFilePath } = await retrieveAudiobookFilePaths(fileName, chapter, part, timestamp, speed);
+
+    // Cache the metadata and cover image path
+    metaDataCacheMap.set(fileName, {
+      metadata,
+      coverImagePath,
+      originalFilePath: fileName,
+    });
+
+    return {
+      outputPaths,
+      originalFilePath,
+      metadata,
+      coverImagePath,
+    };
   } catch (error) {
-    console.error('Error selecting audiobook:', error);
+    console.error('Error in selectAudiobookAndRetrievePaths');
     throw error;
   }
 }
@@ -195,99 +199,78 @@ getFileNameFromTitle = (title) => {
   return titleToFileMap[title]; 
 }
 
-function findClosestMatch(userInput) {
-  const titles = Object.keys(titleToFileMap);
+async function findClosestMatch(userInput) {
+  try {
+    // Fetch the list of audiobooks
+    const audiobooks = cachedAudiobooks ?? await listAudiobooks();
+    if (!cachedAudiobooks) cachedAudiobooks = audiobooks; // Cache the audiobooks if not already cached
 
-  const normalizedInput = userInput.toLowerCase();
+    const titles = audiobooks.map((book) => book.title); // Extract titles from the list
 
-  // 1. Check for exact matches first
-  const exactMatch = titles.find(title => title.toLowerCase() === normalizedInput);
-  if (exactMatch) {
-    return exactMatch;
+    const normalizedInput = userInput;
+
+    // 1. Check for exact matches first
+    const exactMatch = titles.find((title) => title.toLowerCase().includes(normalizedInput.toLowerCase()));
+    if (exactMatch) {
+      return path.basename(path.normalize(titleToFileMap[exactMatch])); // Return the mapped filename
+    }
+
+    // 2. Check for a prefix match
+    const prefixPattern = new RegExp(`^${normalizedInput}:`, 'i');
+    const prefixMatch = titles.find((title) => prefixPattern.test(title));
+    if (prefixMatch) {
+      return path.basename(path.normalize(titleToFileMap[prefixMatch])); // Return the mapped filename
+    }
+
+    // 3. Use fuzzy matching with token sorting
+    const options = {
+      scorer: fuzzball.token_sort_ratio, // More accurate for structured names
+      processor: (choice) => choice.toLowerCase(),
+      limit: 1,
+    };
+
+    const matches = fuzzball.extract(normalizedInput, titles, options);
+    const bestMatch = matches.length > 0 ? matches[0] : null;
+
+    // 4. Ensure the match is strong enough
+    const MIN_SCORE_THRESHOLD = 40;
+    if (bestMatch && bestMatch[1] >= MIN_SCORE_THRESHOLD) {
+      return path.basename(path.normalize(titleToFileMap[bestMatch[0]])); // Return the mapped filename
+    }
+
+    return null; // No match found
+  } catch (error) {
+    console.error('Error finding closest match');
+    throw error;
   }
-
-  // 2. Check for a prefix match
-  const prefixPattern = new RegExp(`^${normalizedInput}:`, 'i');
-  const prefixMatch = titles.find(title => prefixPattern.test(title));
-  if (prefixMatch) {
-    return prefixMatch;
-  }
-
-  // 3. Use fuzzy matching with token sorting
-  const options = {
-    scorer: fuzzball.token_sort_ratio, // More accurate for structured names
-    processor: choice => choice.toLowerCase(),
-    limit: 1
-  };
-
-  const matches = fuzzball.extract(normalizedInput, titles, options);
-  const bestMatch = matches.length > 0 ? matches[0] : null;
-
-  // 4. Ensure the match is strong enough
-  const MIN_SCORE_THRESHOLD = 40;
-  if (bestMatch && bestMatch[1] >= MIN_SCORE_THRESHOLD) {
-    return bestMatch[0];
-  }
-
-  if (bestMatch && bestMatch[2] >= MIN_SCORE_THRESHOLD) {
-    return bestMatch[0];
-  }
-
-  return null;
-}
-
-function normalizePath(filePath) {
-  const platform = os.platform(); // Detect the platform (e.g., 'win32' for Windows, 'linux' for Linux)
-
-  // Replace backslashes with forward slashes for consistency
-  let normalizedPath = filePath.replace(/\\/g, '/');
-
-  if (platform === 'win32') {
-      // Windows: Remove "<dvrDeviceName>/Audiobooks/" if it exists
-      normalizedPath = normalizedPath.replace(new RegExp(`^/?${dvrDeviceName}/Audiobooks/`, 'i'), '');
-  } else if (platform === 'linux') {
-      // Linux: Remove "mnt/audiobooks/" if it exists
-      normalizedPath = normalizedPath.replace(/^\/?mnt\/audiobooks\//, '');
-  }
-
-  return normalizedPath;
 }
 
 async function updateAudiobookCache() {
-  const platform = os.platform();
-  const baseDir = platform === 'win32' ? `\\\\${dvrDeviceName}\\Audiobooks` : '/mnt/audiobooks';
-
   try {
-    const files = await fs.promises.readdir(baseDir);
-    const audiobooks = files.map(file => ({
-      title: path.basename(file, path.extname(file)),
-      file: path.join(baseDir, file),
+    // Fetch the list of audiobooks using listAudiobooks
+    const audiobooks = await listAudiobooks();
+
+    // Map the audiobooks to the cache format
+    cachedAudiobooks = audiobooks.map((book) => ({
+      title: book.title, // Use the title from the listAudiobooks response
+      file: path.basename(path.normalize(book.file)),   // Use the file path from the listAudiobooks response
     }));
 
-    cachedAudiobooks = audiobooks;
-    console.log('Audiobook cache updated:', cachedAudiobooks);
+    // Update the titleToFileMap for quick lookups
+    titleToFileMap = cachedAudiobooks.reduce((map, book) => {
+      map[book.title] = path.basename(path.normalize(book.file));
+      return map;
+    }, {});
+
+    resolve(audiobooks);
+    console.log('Audiobook cache updated successfully');
   } catch (error) {
     console.error('Error updating audiobook cache:', error);
   }
 }
 
-async function listAudiobooksFromSource() {
-  console.log('function listAudiobooksFromSource()');
-  const files = await fs.promises.readdir(`\\\\${dvrDeviceName}\\Audiobooks`);
-  return new Promise((resolve, reject) => {
-    const audiobooks = files.map(file => {
-      const title = path.basename(file, path.extname(file));
-      return { file, title };
-    });
-    console.log('Successfully listed audiobooks from source:', audiobooks);
-    resolve(audiobooks);
-  });
-}
-
-function getUserBooksInProgress(userId) {
-  if (!userPositionsCache) {
-    loadUserPositions();
-  }
+async function getUserBooksInProgress(userId) {
+  loadUserPositions();
   if (!userPositionsCache[userId]) {
     return [];
   }
@@ -295,6 +278,49 @@ function getUserBooksInProgress(userId) {
     title: title.toLowerCase(), // Normalize title to lowercase
     ...userPositionsCache[userId][title]
   }));
+}
+
+async function processFile(filePath, startTime = 0, speed = 1, action = 'seek') {
+  try {
+    const response = await axios.post(`${hostServiceUrl}/process`, {
+      filePath,
+      startTime,
+      speed,
+      action,
+    });
+    return {
+      tempFilePath: path.basename(path.normalize(response.data.tempFilePath)),
+      originalFilePath: path.basename(path.normalize(response.data.originalFilePath)),
+    };
+  } catch (error) {
+    console.error(`Error processing file (${action}):`, error);
+    throw error;
+  }
+}
+
+// Request smbService.js to delete a temp file
+async function deleteTempFile(tempFilePath) {
+  try {
+    await axios.delete(`${hostServiceUrl}/temp`, { data: { tempFilePath } });
+  } catch (error) {
+    console.error('Error deleting temp file:', error);
+  }
+}
+
+async function loadUserPositionsCache() {
+  try {
+    if (fs.existsSync(userPositionFilePath)) {
+      const fileData = fs.readFileSync(userPositionFilePath, 'utf-8');
+      if (fileData.trim()) {
+        const existingData = JSON.parse(fileData);
+        for (const [userID, userAudiobooks] of Object.entries(existingData)) {
+          userPositionsCache[userID] = userAudiobooks;
+        }
+      } 
+    } 
+  } catch (error) {
+    console.error('loadUserPositionsCache: Error loading user positions from file:', error);
+  }
 }
 
 function loadUserPositions() {
@@ -309,20 +335,6 @@ function loadUserPositions() {
     console.error('Error loading user positions. Resetting to an empty object:', error);
     userPositionsCache = {}; // Reset to an empty object if the file is invalid
   }
-}
-
-// Store user's last played timestamp in memory
-function storeUserPosition(userId, audiobookTitle, chapter, part, timestamp, interaction) {
-  if (!audiobookTitle || typeof audiobookTitle !== 'string') {
-    console.error('Invalid audiobook title:', audiobookTitle);
-    return; // Skip storing the position if the title is invalid
-  }
-
-  if (!userPositionsCache[userId]) {
-    userPositionsCache[userId] = {};
-  }
-
-  userPositionsCache[userId][audiobookTitle] = { chapter, part, timestamp };
 }
 
 let isSaving = false;
@@ -351,71 +363,12 @@ function scheduleUserPositionSaving() {
 }
 
 // Retrieve user's last played timestamp from memory
-function getUserPosition(userId, audiobookTitle) {
-  if (userPositionsCache[userId] && userPositionsCache[userId][audiobookTitle]) {
-    return userPositionsCache[userId][audiobookTitle];
-  }
-  return null;
+function getUserPosition(userId, bookTitle) {
+  if (!userPositionsCache[userId]) loadUserPositionsCache();
+  const userPositions = userPositionsCache[userId] || {};
+  return userPositions[bookTitle] || null; // Use the original title as the key
 }
 
-async function skipAudiobook(interaction, offset, userPlayers, userCurrentAudiobook, userCurrentPart, userCurrentChapter, updateUIMessage) {
-  try {
-    const user = interaction.user;
-    const player = userPlayers.get(user.id);
-    if (!player) {
-      await interaction.followUp('No audiobook is currently playing.');
-      return;
-    }
-
-    // Retrieve the current audiobook title for the user
-    const selectedAudiobook = userCurrentAudiobook.get(user.id);
-    if (!selectedAudiobook) {
-      await interaction.followUp('No audiobook is currently playing.');
-      return;
-    }
-
-    const userPosition = getUserPosition(user.id, selectedAudiobook);
-    let currentChapter = userPosition.chapter || 0;
-    let currentTimestamp = userPosition.timestamp || 0;
-    let currentPart = userCurrentPart.get(user.id) || 0;
-    if (userPosition) {
-      currentPart = userPosition.part;
-      currentChapter = userPosition.chapter;
-      currentTimestamp = userPosition.timestamp;
-    }
-
-    // Calculate the new timestamp
-    const newTimestamp = currentTimestamp + (offset * 1000);
-
-    // Generate a new MP3 file for the new timestamp
-    const { outputPaths: initialChapterParts, metadata, coverImagePath } = await selectAudiobookAndRetrievePaths(selectedAudiobook, currentChapter, currentPart, newTimestamp);
-
-    if (!initialChapterParts || initialChapterParts.length === 0) {
-      await interaction.followUp('Error: No parts found.');
-      return;
-    }
-
-    const currentPartPath = initialChapterParts[currentPart];
-    const resource = createAudioResource(currentPartPath);
-    player.play(resource);
-
-    // Update the user's position
-    storeUserPosition(user.id, selectedAudiobook, currentChapter, currentPart, newTimestamp, interaction);
-    await updateUIMessage(`Skipped ${offset} seconds.`);
-  } catch (error) {
-    console.error('Error skipping audiobook:', error);
-    await updateUIMessage('An error occurred while skipping the audiobook.');
-  }
-}
-
-// Retrieve user's last played timestamp
-function getUserPosition(userId, audiobookTitle) {
-  const userPositions = JSON.parse(fs.readFileSync(userPositionFilePath, 'utf8'));
-  if (userPositions[userId] && userPositions[userId][audiobookTitle]) {
-    return userPositions[userId][audiobookTitle];
-  }
-  return null;
-}
 
 let isUpdatingCache = false;
 // Schedule cache updates once a week
@@ -434,42 +387,32 @@ function scheduleCacheUpdates() {
   }
 }
 
+async function getChapterCount(title) {
+  let fileName = await findClosestMatch(title);
+  if (!fileName) {
+    throw new Error('No matching audiobook found');
+  }  
+  fileName = path.basename(path.normalize(fileName)); // Get the file name without the path
+  const folderPath = path.join(baseDir, fileName.split('.')[0]);
 
-function getM4BMetadata(filePath) {
-  return new Promise((resolve, reject) => {
-    execFile('ffprobe', ['-v', 'error', '-show_entries', 'format_tags=artist,title', '-of', 'json', filePath], (err, stdout) => {
-      if (err) {
-        return reject(err);
-      }
-      const metadata = JSON.parse(stdout);
-      const tags = metadata.format.tags || {};
-      resolve({
-        author: tags.artist || 'Unknown Author',
-        title: tags.title || 'Unknown Title',
-      });
-    });
-  });
-}
+  // Parse the directory to find all parts
+  const files = await fs.promises.readdir(folderPath);
+  const chapterCount = files?.length > 0
+  ? (() => {
+      return files.reduce((maxChapter, file) => {
+        // Get the original file path if it's a temp file
+        const filePath = tempFilenameToOriginalMap.get(path.basename(path.normalize(file))) || file;
 
-function getM4BCoverImage(filePath) {
-  return new Promise((resolve, reject) => {
-    const coverImagePath = path.join(localOutputDir, `${uuidv4()}.jpg`);
-    const ffmpeg = spawn('ffmpeg', ['-i', filePath, '-an', '-vcodec', 'copy', coverImagePath]);
+        // Extract the chapter number from the filename
+        const match = path.basename(path.normalize(filePath)).match(/Chapter_(\d+)/i);
+        const chapterNumber = match ? parseInt(match[1], 10) : 0;
 
-    ffmpeg.on('close', (code) => {
-      resolve(coverImagePath);
-    });
-  });
-}
-
-async function convertFile(filePath, startTime) {
-  try {
-    const response = await axios.post(`${hostServiceUrl}/convert`, { filePath, startTime });
-    return response.data.outputFilePath;
-  } catch (error) {
-    console.error('Error converting file:', error);
-    throw error;
-  }
+        // Update the maximum chapter number
+        return Math.max(maxChapter, chapterNumber);
+      }, 0); // Start with 0 as the initial maxChapter value
+    })()
+  : 0;
+  return chapterCount;
 }
 
 // Load cache on startup
@@ -477,19 +420,18 @@ loadCache();
 scheduleCacheUpdates();
 
 module.exports = {
+  processFile,
+  deleteTempFile,
+  getChapterCount,
   listAudiobooks,
   retrieveAudiobookFilePaths,
   selectAudiobookAndRetrievePaths,
   updateAudiobookCache,
-  storeUserPosition,
-  skipAudiobook,
   getUserPosition,
   findClosestMatch,
   getFileNameFromTitle,
-  getM4BCoverImage,
-  getM4BMetadata,
-  convertFile, 
   loadUserPositions, 
   scheduleUserPositionSaving,
-  getUserBooksInProgress
+  getUserBooksInProgress,
+  saveCache
 };
