@@ -6,9 +6,11 @@ const { exec, spawn, execFile } = require('child_process');
 const { v4: uuidv4 } = require('uuid'); // Import uuid
 const { createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const axios = require('axios');
+const wol = require('wake_on_lan');
 
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') }); // Explicitly load .env from the DiscordBot directory
 
+const dvrMacAddress = process.env.DVR_MAC_ADDRESS; // MAC address for Wake-on-LAN
 const dvrAddress = process.env.DVR_ADDRESS;
 const dvrPort = process.env.DVR_PORT;
 const cacheFilePath = path.join(__dirname, 'audiobookCache.json');
@@ -63,6 +65,14 @@ async function listAudiobooks() {
     const response = await axios.get(`${hostServiceUrl}/audiobooks`);
     return response.data;
   } catch (error) {
+    // try wol
+    wol.wake(dvrMacAddress, function (error) {
+      if (error) {
+        console.log('Wake-on-LAN error', error);
+      } else {
+        console.log('Wake-on-LAN packet sent');
+      }
+    });
     console.error('Error listing audiobooks');
     throw error;
   }
@@ -137,7 +147,7 @@ const metaDataCacheMap = new Map();
 async function selectAudiobookAndRetrievePaths(userInput, chapter, part = 0, timestamp = 0, speed = 1) {
   try {
     // Find the closest matching audiobook file
-    const fileName = path.basename(await findClosestMatch(userInput));
+    const fileName = path.basename(path.normalize(await findClosestTitleFile(userInput)));
     if (!fileName) {
       throw new Error(`No matching audiobook found for input: ${userInput}`);
     }
@@ -199,7 +209,9 @@ getFileNameFromTitle = (title) => {
   return titleToFileMap[title]; 
 }
 
-async function findClosestMatch(userInput) {
+/** Returns the title file for the audiobook .m4b 
+ *  Given the title key: userInput*/
+async function findClosestTitleFile(userInput) {
   try {
     // Fetch the list of audiobooks
     const audiobooks = cachedAudiobooks ?? await listAudiobooks();
@@ -212,14 +224,16 @@ async function findClosestMatch(userInput) {
     // 1. Check for exact matches first
     const exactMatch = titles.find((title) => title.toLowerCase().includes(normalizedInput.toLowerCase()));
     if (exactMatch) {
-      return path.basename(path.normalize(titleToFileMap[exactMatch])); // Return the mapped filename
+      let fileName = titleToFileMap[exactMatch.replace(' (Unabridged)', '').split(":")[0]]; // Get the file name from the map
+      if (fileName) return path.basename(path.normalize(fileName)); // Return the mapped filename
     }
 
     // 2. Check for a prefix match
     const prefixPattern = new RegExp(`^${normalizedInput}:`, 'i');
     const prefixMatch = titles.find((title) => prefixPattern.test(title));
     if (prefixMatch) {
-      return path.basename(path.normalize(titleToFileMap[prefixMatch])); // Return the mapped filename
+      let fileName = titleToFileMap[prefixMatch.replace(' (Unabridged)', '').split(":")[0]]; // Get the file name from the map
+      if (fileName) return path.basename(path.normalize(fileName)); // Return the mapped filename
     }
 
     // 3. Use fuzzy matching with token sorting
@@ -235,12 +249,28 @@ async function findClosestMatch(userInput) {
     // 4. Ensure the match is strong enough
     const MIN_SCORE_THRESHOLD = 40;
     if (bestMatch && bestMatch[1] >= MIN_SCORE_THRESHOLD) {
-      return path.basename(path.normalize(titleToFileMap[bestMatch[0]])); // Return the mapped filename
+      let title = bestMatch[0].replace(' (Unabridged)', '').split(':')[0]
+      return path.basename(path.normalize(titleToFileMap[title])); // Return the mapped filename
     }
 
     return null; // No match found
   } catch (error) {
-    console.error('Error finding closest match');
+    console.error('Error finding closest match', error);
+    throw error;
+  }
+}
+
+async function getAudiobookTitleFromFile(fileName) {
+  try {
+    // Fetch the list of audiobooks
+    const audiobooks = cachedAudiobooks ?? await listAudiobooks();
+    if (!cachedAudiobooks) cachedAudiobooks = audiobooks; // Cache the audiobooks if not already cached
+
+    // Find the audiobook with the matching file name
+    const audiobook = audiobooks.find((book) => path.basename(path.normalize(book.file)) === fileName);
+    return audiobook ? audiobook.title.replace(' (Unabridged)', '').split(':')[0] : null;
+  } catch (error) {
+    console.error('Error retrieving audiobook title from file name:', error);
     throw error;
   }
 }
@@ -258,11 +288,9 @@ async function updateAudiobookCache() {
 
     // Update the titleToFileMap for quick lookups
     titleToFileMap = cachedAudiobooks.reduce((map, book) => {
-      map[book.title] = path.basename(path.normalize(book.file));
+      map[book.title.replace(' (Unabridged)', '').split(':')[0]] = path.basename(path.normalize(book.file));
       return map;
     }, {});
-
-    resolve(audiobooks);
     console.log('Audiobook cache updated successfully');
   } catch (error) {
     console.error('Error updating audiobook cache:', error);
@@ -388,7 +416,7 @@ function scheduleCacheUpdates() {
 }
 
 async function getChapterCount(title) {
-  let fileName = await findClosestMatch(title);
+  let fileName = await findClosestTitleFile(title);
   if (!fileName) {
     throw new Error('No matching audiobook found');
   }  
@@ -428,10 +456,11 @@ module.exports = {
   selectAudiobookAndRetrievePaths,
   updateAudiobookCache,
   getUserPosition,
-  findClosestMatch,
+  findClosestTitleFile,
   getFileNameFromTitle,
   loadUserPositions, 
   scheduleUserPositionSaving,
   getUserBooksInProgress,
-  saveCache
+  saveCache,
+  getAudiobookTitleFromFile
 };

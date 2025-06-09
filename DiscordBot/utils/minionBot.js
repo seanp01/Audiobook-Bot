@@ -1,5 +1,5 @@
-const { processFile, getUserBooksInProgress, loadUserPositions, scheduleUserPositionSaving, getChapterCount, listAudiobooks, findClosestMatch, getFileNameFromTitle, skipAudiobook, retrieveAudiobookFilePaths, selectAudiobookAndRetrievePaths, updateAudiobookCache, getUserPosition, deleteTempFile} = require('./smbAccess');
-const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { processFile, getUserBooksInProgress, loadUserPositions, scheduleUserPositionSaving, getChapterCount, listAudiobooks, findClosestTitleFile, getFileNameFromTitle, skipAudiobook, retrieveAudiobookFilePaths, selectAudiobookAndRetrievePaths, updateAudiobookCache, getUserPosition, deleteTempFile} = require('./smbAccess');
+const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActivityType } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, getVoiceConnection, createAudioResource, AudioPlayerStatus, StreamType } = require('@discordjs/voice');
 const { v4: uuidv4 } = require('uuid');
 require('@discordjs/opus');
@@ -12,6 +12,13 @@ const os = require('os');
 
 // Retrieve minionId and minionToken from command-line arguments
 const [minionId, minionToken] = process.argv.slice(2);
+
+const playEmojiID = process.env.PLAY_EMOJI_ID;
+const pauseEmojiID = process.env.PAUSE_EMOJI_ID;
+const nextEmojiID = process.env.NEXT_EMOJI_ID;
+const backEmojiID = process.env.BACK_EMOJI_ID;
+const plusFifteenEmojiID = process.env.PLUS_FIFTEEN_EMOJI_ID;
+const minusFifteenEmojiID = process.env.MINUS_FIFTEEN_EMOJI_ID;
 
 const tempFiles = new Set(); // Track temporary files created by this minion
 const audioDurationCache = new Map();
@@ -70,7 +77,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit() && interaction.customId === 'seek_modal_submit') {
       const timestampInput = interaction.fields.getTextInputValue('seek_timestamp');
       if (!interaction.deferred) interaction.deferUpdate(); // Acknowledge the interaction immediately
-      const titleFile = await findClosestMatch(playbackData.audiobookTitle);
+      const titleFile = await path.basename(path.normalize(await findClosestTitleFile(playbackData.audiobookTitle)));
 
       try {
         // Parse the timestamp (HH:MM:SS)
@@ -173,6 +180,7 @@ client.on('interactionCreate', async (interaction) => {
         playbackData.chapterParts[part] = newFilePath;
         playbackData.speed = selectedSpeed; // Store the selected speed in playbackData
         await updatePlayback();
+        await updatePlaybackUI(); // Update the playback UI with the new speed
         return;
       }
     }
@@ -180,7 +188,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton()) {
       const command = interaction.customId;
       if (command === 'seek_modal') {
-        let fileName = path.basename(path.normalize(await findClosestMatch(playbackData.audiobookTitle)));
+        let fileName = path.basename(path.normalize(await findClosestTitleFile(playbackData.audiobookTitle)));
 
         let { outputPaths, originalFilePath } = await retrieveAudiobookFilePaths(fileName, playbackData.currentChapter, 0, 0, 1);
         if (!outputPaths || outputPaths.length === 0) {
@@ -226,7 +234,6 @@ client.on('interactionCreate', async (interaction) => {
         try {        
           // Check if the playback UI message is in memory
           const isMessageInMemory = progressBarMessage && progressBarMessage.id === interaction.message.id;
-      
           // Check if the player exists
           let isPlayerActive = false;
           if (player) {
@@ -246,12 +253,10 @@ client.on('interactionCreate', async (interaction) => {
             return;
           }
           // Extract metadata from the seek UI message
-
-          currentAudiobook = command.replace('play_pause_', ''); // Extract the book title from the embed
-          currentAudiobook = currentAudiobook.replace(/_/g, ' '); // Replace underscores with spaces
+          playbackUiMessage = null; // Resend the playback UI message
+          currentAudiobook = command.replace('play_pause_', '').replaceAll('_', ' ').replace(' (Unabridged)', '').split(':')[0]; // Extract the book title from the embed
           const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
           if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
-          currentAudiobook = audiobooks.find(ab => ab.title.toLowerCase().includes(currentAudiobook.toLowerCase()))?.title.split(':')[0];
           const userPosition = getUserPosition(interaction.user.id, currentAudiobook);
           await interaction.channel.send(`Loading ${currentAudiobook}... Please Wait`);
       
@@ -281,7 +286,7 @@ client.on('interactionCreate', async (interaction) => {
             speed: 1.0, // Default speed
           };
           
-          let fileName = path.basename(path.normalize(await findClosestMatch(currentAudiobook))); // Find the closest match for the audiobook title
+          let fileName = path.basename(path.normalize(await findClosestTitleFile(currentAudiobook))); // Find the closest match for the audiobook title
           // Retrieve audiobook parts and metadata
           let { outputPaths: chapterParts, originalFilePath, metadata, coverImagePath } = await selectAudiobookAndRetrievePaths(
             currentAudiobook,
@@ -411,7 +416,7 @@ process.on('message', async (message) => {
         if (!outputPaths || outputPaths.length === 0) {
           console.log('No parts found, trying next chapter...', playbackData);
           playbackData.currentChapter += 1 // Increment the chapter number
-          const fileName = path.basename(path.normalize(await findClosestMatch(playbackData.audiobookTitle))); // Find the closest match for the audiobook title
+          const fileName = path.basename(path.normalize(await findClosestTitleFile(playbackData.audiobookTitle))); // Find the closest match for the audiobook title
           ({ outputPaths, originalFilePath } = await retrieveAudiobookFilePaths(fileName, playbackData.currentChapter, 0, 0, 1)); // Retrieve the chapter parts
         } 
 
@@ -424,7 +429,6 @@ process.on('message', async (message) => {
         playbackData.coverImageUrl = playbackData.coverImageUrl ?? getDynamicCoverImageUrl(path.basename(path.normalize(coverImagePath)));
         playbackData.author = metadata.author || 'Unknown Author';
         playbackData.seekOffset = 0; // Reset the seek offset
-
         // Start playback
         await startPlayback();
         await updatePlaybackUI();
@@ -514,9 +518,11 @@ async function endSession() {
 
 async function setBotStatus(audiobookTitle) {
   try {
-    if (audiobookTitle) client.user.setActivity(`Listening to: ${audiobookTitle}`, { type: 'LISTENING' });
-    else client.user.setActivity('Idle', { type: 'PLAYING' });
-    console.log(`Bot status updated to: Listening to ${audiobookTitle}`);
+    if (audiobookTitle) {
+      await client.user.setActivity(`${audiobookTitle}`, { type: ActivityType.Listening });
+    } else {
+      await client.user.setActivity('Idle', { type: ActivityType.Playing });
+    }
   } catch (error) {
     console.error('Error setting bot status:', error);
   }
@@ -553,7 +559,7 @@ async function startPlayback() {
     chapterDurationCache.clear(); // Clear the chapter duration cache when starting playback
 
     // if the file has a map pairing, it is a temp file. Otherwise, it is the original
-    //const bookFileName = await findClosestMatch(playbackData.audiobookTitle);
+    //const bookFileName = await findClosestTitleFile(playbackData.audiobookTitle);
     //const filePath = path.join(bookFileName.split('.')[0], tempFilenameToOriginalMap.get(path.basename(chapterParts[currentPart]))) || chapterParts[currentPart];
     //const audiobookDir = path.join(baseDir, bookFileName.split('.')[0]);
     // Call the /process endpoint to process the current part
@@ -580,7 +586,7 @@ async function startPlayback() {
     }
 
     // Create the audio resource and play it
-    const fileName = await findClosestMatch(playbackData.audiobookTitle); // Find the closest match for the audiobook title
+    const fileName = await findClosestTitleFile(playbackData.audiobookTitle); // Find the closest match for the audiobook title
     const isTempFile = tempFilenameToOriginalMap.has(path.basename(path.normalize(chapterParts[part])));
     let filePath = '';
 
@@ -615,7 +621,7 @@ async function updatePlayback() {
       console.error('No chapter parts available for playback.');
       return;
     }
-    const fileName = await findClosestMatch(playbackData.audiobookTitle); 
+    const fileName = await findClosestTitleFile(playbackData.audiobookTitle); 
     const file = chapterParts.length > 1 ? path.basename(path.normalize(chapterParts[currentPart])) : path.basename(path.normalize(chapterParts[0]));
     const isTempFile = tempFilenameToOriginalMap.has(file);
     let filePath = path.join(baseDir, fileName.split('.')[0], file);
@@ -653,8 +659,8 @@ async function loadChapter() {
 
     if (!chapterParts || chapterParts.length === 0) {
       playbackData.currentChapter += 1 // Increment the chapter number
-      const fileName = path.basename(path.normalize(await findClosestMatch(audiobookTitle))); // Find the closest match for the audiobook title
-      ({ outputPaths: chapterParts, originalFilePath } = await retrieveAudiobookFilePaths(fileName, playbackData.currentChapter, 0, 0, 1)); // Retrieve the chapter parts
+      let titleFile = path.basename(path.normalize(await findClosestTitleFile(audiobookTitle))); // Find the closest match for the audiobook title
+      ({ outputPaths: chapterParts, originalFilePath } = await retrieveAudiobookFilePaths(titleFile, playbackData.currentChapter, 0, 0, 1)); // Retrieve the chapter parts
     }
 
     if (!chapterParts || chapterParts.length === 0) {
@@ -679,7 +685,7 @@ async function handleNextPart() {
   let thisPartIndex = currentPart;
   const isTempFile = tempFilenameToOriginalMap.has(path.basename(path.normalize(chapterParts[currentPart])));
   if (isTempFile) {
-    const fileName = path.basename(path.normalize(await findClosestMatch(audiobookTitle))); // Find the closest match for the audiobook title
+    const fileName = path.basename(path.normalize(await findClosestTitleFile(audiobookTitle))); // Find the closest match for the audiobook title
     let { outputPaths } = await retrieveAudiobookFilePaths(fileName, currentChapter, currentPart, 0, speed); // Retrieve the chapter parts
     thisChapterParts = outputPaths;
     thisPartIndex = outputPaths.findIndex(part => part === path.basename(path.normalize(tempFilenameToOriginalMap.get(path.basename(path.normalize(chapterParts[currentPart]))))));
@@ -735,7 +741,7 @@ async function handleNextPart() {
 
       if (!outputPaths || outputPaths.length === 0) {
         playbackData.currentChapter += 1 // Increment the chapter number
-        const fileName = await path.basename(path.normalize(findClosestMatch(playbackData.audiobookTitle))); // Find the closest match for the audiobook title
+        const fileName = await path.basename(path.normalize(await findClosestTitleFile(playbackData.audiobookTitle))); // Find the closest match for the audiobook title
         ({ outputPaths, originalFilePath } = await retrieveAudiobookFilePaths(fileName, playbackData.currentChapter, 0, 0, 1)); // Retrieve the chapter parts
       } 
 
@@ -813,8 +819,93 @@ async function updatePlaybackUI() {
       }
     } else {
       // If the playback UI message doesn't exist, create a new one
-      playbackUiMessage = await channel.send({ embeds: [embed] });
+      // Split chapters into groups of 25
+      const chapterCount = bookChapterCountCache.get(playbackData.audiobookTitle) || 1;
+      const chapterOptions = Array.from({ length: chapterCount }, (_, i) => ({
+        label: `Chapter ${i + 1}`,
+        value: `${i + 1}`,
+      }));
+      const chapterGroups = splitChaptersIntoGroups(chapterOptions, 25); // Split chapters into groups of 25
 
+      // Paginate the chapter groups into pages of 5 rows each
+      const chapterPages = [];
+      for (let i = 0; i < chapterGroups.length; i += 5) {
+        chapterPages.push(chapterGroups.slice(i, i + 5));
+      }
+
+      let currentPage = 0;
+
+      // Helper function to update the chapter selection message
+      async function updateChapterSelectionPage(page) {
+        const rows = chapterPages[page].map((group, index) =>
+          new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder()
+              .setCustomId(`chapter_select_${page}_${index}`)
+              .setPlaceholder(`Select Chapter (Group ${page * 5 + index + 1})`)
+              .addOptions(group)
+          )
+        );
+
+        // Add navigation buttons if there are multiple pages
+        if (chapterPages.length > 1) {
+          const navigationRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId('prev_chapter_page')
+              .setLabel('Previous')
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(page === 0),
+            new ButtonBuilder()
+              .setCustomId('next_chapter_page')
+              .setLabel('Next')
+              .setStyle(ButtonStyle.Secondary)
+              .setDisabled(page === chapterPages.length - 1)
+          );
+          rows.push(navigationRow);
+        }
+
+        // Send or update the chapter selection message
+        if (playbackUiMessage) {
+          await playbackUiMessage.edit({ embeds: [embed], components: rows });
+        } else {
+          playbackUiMessage = await channel.send({ embeds: [embed], components: rows });
+        }
+      }
+
+      // Initialize the first page
+      await updateChapterSelectionPage(currentPage);
+
+      // Create a collector for navigation buttons
+      const collector = channel.createMessageComponentCollector({
+        filter: (i) => i.user.id === playbackData.userID,
+        time: 60000, // 1-minute timeout
+      });
+
+      collector.on('collect', async (i) => {
+        if (i.customId === 'prev_chapter_page') {
+          currentPage = Math.max(currentPage - 1, 0);
+          await i.deferUpdate();
+          await updateChapterSelectionPage(currentPage);
+        } else if (i.customId === 'next_chapter_page') {
+          currentPage = Math.min(currentPage + 1, chapterPages.length - 1);
+          await i.deferUpdate();
+          await updateChapterSelectionPage(currentPage);
+        }
+      });
+
+      collector.on('end', async () => {
+        // Disable navigation buttons when the collector ends
+        if (playbackUiMessage) {
+          const rows = chapterPages[currentPage].map((group, index) =>
+            new ActionRowBuilder().addComponents(
+              new StringSelectMenuBuilder()
+                .setCustomId(`chapter_select_${currentPage}_${index}`)
+                .setPlaceholder(`Select Chapter (Group ${currentPage * 5 + index + 1})`)
+                .addOptions(group)
+            )
+          );
+          await playbackUiMessage.edit({ embeds: [embed], components: rows });
+        }
+      });
       // Delete and resend the progress bar
       if (progressBarMessage) {
         await progressBarMessage.delete().catch(() => null); // Delete the existing progress bar
@@ -831,12 +922,13 @@ async function updatePlaybackUI() {
 
 let isUpdatingProgressBar = false; // Lock for updateProgressBar
 let progressBarMessage = null; // Track the progress bar message
+let slowExecutionCount = 0; // Track consecutive slow executions
 
 async function updateProgressBar() {
   if (isUpdatingProgressBar || !playbackData || isSeekLocked) return;
 
   isUpdatingProgressBar = true; // Set the lock
-
+  const startTime = Date.now(); // Start timing the function
   try {
     const {
       currentChapter = 1,
@@ -850,7 +942,7 @@ async function updateProgressBar() {
     if (chapterParts.length == 1) part = 0; // If there's only one part, set part to 0
     let durationDifference = 0; // Initialize duration difference
 
-    let fileName = await findClosestMatch(playbackData.audiobookTitle);
+    let fileName = await findClosestTitleFile(playbackData.audiobookTitle);
     const isTempFile = tempFilenameToOriginalMap.has(path.basename(path.normalize(chapterParts[part])));
     let originalFilePath = path.join(baseDir, fileName.split('.')[0], path.basename(path.normalize(chapterParts[part])));
     if (isTempFile) {
@@ -892,23 +984,23 @@ async function updateProgressBar() {
       .addComponents(
         new ButtonBuilder()
           .setCustomId('prev')
-          .setLabel('⏮️ Previous')
+          .setEmoji(backEmojiID)
           .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId('back')
-          .setLabel('↩️ Rewind')
+          .setEmoji(minusFifteenEmojiID)
           .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId(`play_pause_${playbackData.audiobookTitle.replace(' (Unabridged)', '').split(':')[0].replace(/\s+/g, '_')}`) // Include the audiobook title
-          .setLabel(isPlaying ? '⏸️ Pause' : '▶️ Play')
+          .setEmoji(isPlaying ? pauseEmojiID : playEmojiID)
           .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId('skip')
-          .setLabel('↪️ Skip')
+          .setEmoji(plusFifteenEmojiID)
           .setStyle(ButtonStyle.Secondary),
         new ButtonBuilder()
           .setCustomId('next')
-          .setLabel('⏭️ Next')
+          .setEmoji(nextEmojiID)
           .setStyle(ButtonStyle.Secondary)
       );
 
@@ -921,12 +1013,40 @@ async function updateProgressBar() {
           .setStyle(ButtonStyle.Primary)
       );
 
+    const speedRow = new ActionRowBuilder()
+      .addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId('speed_select')
+          .setPlaceholder('Select Playback Speed')
+          .addOptions(
+            { label: '0.25x', value: '0.25' },
+            { label: '0.5x', value: '0.5' },
+            { label: '0.75x', value: '0.75' },
+            { label: '0.80x', value: '0.8' },
+            { label: '0.85x', value: '0.85' },
+            { label: '0.90x', value: '0.9' },
+            { label: '0.95x', value: '0.95' },
+            { label: '1x (Normal)', value: '1.0' },
+            { label: '1.05x', value: '1.05' },
+            { label: '1.1x', value: '1.1' },
+            { label: '1.15x', value: '1.15' },
+            { label: '1.2x', value: '1.2' },
+            { label: '1.25x', value: '1.25' },
+            { label: '1.3x', value: '1.3' },
+            { label: '1.4x', value: '1.4' },
+            { label: '1.5x', value: '1.5' },
+            { label: '2x', value: '2.0' },
+            { label: '3x', value: '3.0' }            
+          )
+      );
+
+
     // Update or create the progress bar message
     if (progressBarMessage) {
       try {
         const message = await channel.messages.fetch(progressBarMessage.id).catch(() => null);
         if (message) {
-          await message.edit({ embeds: [progressEmbed], components: [row, seekRow] });
+          await message.edit({ embeds: [progressEmbed], components: [row, seekRow, speedRow] });
           return;
         }
       } catch (error) {
@@ -935,12 +1055,29 @@ async function updateProgressBar() {
     }
 
     // If the message doesn't exist, create a new one
-    const newMessage = await channel.send({embeds: [progressEmbed], components: [row], seekRow });
+    const newMessage = await channel.send({ embeds: [progressEmbed], components: [row, seekRow, speedRow] });
     progressBarMessage = newMessage;
   } catch (error) {
     console.error('updateProgressBar: error - ui update failed\n', error);
   } finally {
     isUpdatingProgressBar = false; // Release the lock
+
+    const executionTime = Date.now() - startTime; // Calculate execution time
+    if (executionTime >= 3000) {
+      slowExecutionCount++;
+    } else {
+      slowExecutionCount = 0; // Reset the counter if execution is fast
+    }
+
+    // If the function is slow 3 times in a row, delete and resend the message
+    if (slowExecutionCount >= 3) {
+      console.warn('updateProgressBar: Deleting and resending progress bar message due to consistent slow execution.');
+      if (progressBarMessage) {
+        await progressBarMessage.delete().catch(() => null); // Delete the existing message
+        progressBarMessage = null; // Reset the message reference
+      }
+      slowExecutionCount = 0; // Reset the counter
+    }
   }
 }
 
@@ -958,7 +1095,7 @@ async function handleSeekCommand(skipDuration) {
     if (!chapterParts.length > 1 && !chapterParts[currentPart]) return;
     if (chapterParts.length == 1) part = 0; // If there's only one part, set part to 0
     
-    let fileName = await findClosestMatch(playbackData.audiobookTitle);
+    let fileName = await findClosestTitleFile(playbackData.audiobookTitle);
     let isTempFile = tempFilenameToOriginalMap.has(path.basename(path.normalize(chapterParts[part])));
     let originalFilePath = path.join(baseDir, fileName.split('.')[0], path.basename(path.normalize(chapterParts[part])));
     if (isTempFile) {
@@ -1015,7 +1152,7 @@ async function handleTempFileSeek(seekFilePath, newTimestamp) {
   try {
     // Retrieve the original file path from the tempToOriginalMap
 
-    const fileName = await findClosestMatch(playbackData.audiobookTitle);
+    const fileName = await findClosestTitleFile(playbackData.audiobookTitle);
     let isTempFile = tempFilenameToOriginalMap.has(path.basename(path.normalize(seekFilePath)));
     let processFilePath = path.join(fileName.split('.')[0], path.basename(path.normalize(seekFilePath)));
     if (isTempFile) {
@@ -1037,7 +1174,7 @@ async function handleTempFileSeek(seekFilePath, newTimestamp) {
 
 async function handleOriginalFileSeek(originalFilePath, newTimestamp) {
   try {
-    const fileName = await findClosestMatch(playbackData.audiobookTitle);
+    const fileName = await findClosestTitleFile(playbackData.audiobookTitle);
     const audiobookDir = path.join(baseDir, fileName.split('.')[0]);
     // Call the /process endpoint to generate the seeked file
     const { tempFilePath } = await processFile(path.join(fileName.split('.')[0], path.basename(path.normalize(originalFilePath))), newTimestamp, 1, 'seek');
@@ -1056,7 +1193,7 @@ async function handleOriginalFileSeek(originalFilePath, newTimestamp) {
 async function handleSpeedChange(speed) {
   try {
     const { chapterParts, currentPart, currentTimestamp } = playbackData;
-    const fileName = await findClosestMatch(playbackData.audiobookTitle);
+    const fileName = await findClosestTitleFile(playbackData.audiobookTitle);
     const audiobookDir = path.join(baseDir, fileName.split('.')[0]);
     // Get the original file 
     let isTempFile = tempFilenameToOriginalMap.has(path.basename(path.normalize(chapterParts[currentPart])));
@@ -1095,7 +1232,7 @@ async function handleNextChapterCommand() {
 
     if (!chapterParts || chapterParts.length === 0) {
       playbackData.currentChapter += 1 // Increment the chapter number
-      const fileName = await path.basename(path.normalize(findClosestMatch(playbackData.audiobookTitle))); // Find the closest match for the audiobook title
+      const fileName = await path.basename(path.normalize(await findClosestTitleFile(playbackData.audiobookTitle))); // Find the closest match for the audiobook title
       ({ outputPaths: chapterParts } = await retrieveAudiobookFilePaths(fileName, playbackData.currentChapter, 0, 0, 1)); // Retrieve the chapter parts
     }
 
@@ -1133,7 +1270,7 @@ async function handlePreviousChapterCommand() {
 
     if (!chapterParts || chapterParts.length === 0) {
       playbackData.currentChapter -= 1 // Increment the chapter number
-      const fileName = await path.basename(path.normalize(findClosestMatch(playbackData.audiobookTitle))); // Find the closest match for the audiobook title
+      const fileName = await path.basename(path.normalize(await findClosestTitleFile(playbackData.audiobookTitle))); // Find the closest match for the audiobook title
       ({ outputPaths: chapterParts, originalFilePath } = await retrieveAudiobookFilePaths(fileName, playbackData.currentChapter, 0, 0, 1)); // Retrieve the chapter parts
     }
 
@@ -1247,8 +1384,12 @@ async function getAudioDuration(filePath) {
   });
 }
 
+let isStorePositionRunning = false; // Lock to track if the function is running
+
 async function storePosition() {
   try {
+    if (isStorePositionRunning) return; // Prevent multiple executions
+    isStorePositionRunning = true; // Set the lock
     // Ensure the player is active before proceeding
     if (!player || player.state.status !== AudioPlayerStatus.Playing) {
       return; // Exit if the player is not active
@@ -1264,7 +1405,7 @@ async function storePosition() {
 
     let durationDifference = 0;
 
-    let fileName = await findClosestMatch(playbackData.audiobookTitle);
+    let fileName = path.basename(path.normalize(await findClosestTitleFile(playbackData.audiobookTitle)));
     let isTempFile = tempFilenameToOriginalMap.has(path.basename(path.normalize(chapterParts[part])));
     if (isTempFile) {
       const originalFilePath = path.join(baseDir, fileName.split('.')[0], path.basename(path.normalize(tempFilenameToOriginalMap.get(path.basename(path.normalize(chapterParts[part]))))));
@@ -1299,6 +1440,8 @@ async function storePosition() {
     };
   } catch (error) {
     console.error('storePosition: error - store position failed');
+  } finally {
+    isStorePositionRunning = false; // Release the lock
   }
 }
 
@@ -1318,7 +1461,7 @@ async function parseAudioFileLengths(chapterParts) {
   if (!chapterParts || chapterParts.length === 0) {
     return [];
   }
-  const fileName = await findClosestMatch(playbackData.audiobookTitle);
+  const fileName = path.basename(path.normalize(await findClosestTitleFile(playbackData.audiobookTitle)));
   // Calculate the duration of each part
   const partDurations = [];
   for (const part of chapterParts) {
@@ -1542,6 +1685,14 @@ function validatePlaybackData(data) {
     }
   }
   return isValid;
+}
+
+function splitChaptersIntoGroups(chapters, groupSize = 25) {
+  const groups = [];
+  for (let i = 0; i < chapters.length; i += groupSize) {
+    groups.push(chapters.slice(i, i + groupSize));
+  }
+  return groups;
 }
 
 let isCreatePlayerLocked = false; // Lock flag for createPlayer function

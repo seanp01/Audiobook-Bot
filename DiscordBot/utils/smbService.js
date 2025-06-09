@@ -10,11 +10,13 @@ const port = process.env.DVR_PORT; // Port for the service
 const coverArtPort = process.env.COVER_ART_PORT; // Port for the image server
 const dvrDeviceName = process.env.DVR_DEVICE_NAME;
 const localDrive = process.env.LOCAL_DRIVE_LETTER; // Local drive letter (e.g., 'C:') 
+const downloadPort = process.env.DOWNLOAD_PORT; // Port for the download server
 const audiobooksDir = `${localDrive}\\Audiobooks`; // Path to the audiobooks directory on the host PC
 const tempDir = path.join(audiobooksDir, 'temp'); // Temporary directory for processing
 const os = require('os'); // Import the os module
 const imageDirectory = path.join(audiobooksDir, 'temp');
 
+const downloadHost = express();
 const imageHost = express();
 
 imageHost.use('/images', express.static(imageDirectory, {
@@ -34,6 +36,27 @@ imageHost.use((err, req, res, next) => {
 });
 
 imageHost.get('*', (req, res) => {
+  console.log('Request for:', req.url);
+  res.status(404).send('Not Found');
+});
+
+downloadHost.use('/downloads', express.static(audiobooksDir, {
+  fallthrough: false, // Ensure that requests are not passed to the next middleware if the file is not found
+  setHeaders: (res, path) => {
+    res.set('Content-Type', 'audio/m4b'); // Set the content type to audio/m4b
+  }
+}));
+
+downloadHost.listen(downloadPort, '0.0.0.0', () => {
+  console.log(`Download server running on port ${downloadPort}/downloads/`);
+});
+
+downloadHost.use((err, req, res, next) => {
+  console.error('Error serving download');
+  res.status(500).send('Internal Server Error');
+});
+
+downloadHost.get('*', (req, res) => {
   console.log('Request for:', req.url);
   res.status(404).send('Not Found');
 });
@@ -114,7 +137,7 @@ app.post('/metadata', (req, res) => {
   const { filePath } = req.body;
 
   // Normalize the path based on the platform
-  const normalizedPath = normalizePath(filePath);
+  const normalizedPath = normalizePath(path.basename(path.normalize(filePath)));
   const fullPath = path.join(audiobooksDir, normalizedPath);
 
   execFile('ffprobe', ['-v', 'error', '-show_entries', 'format_tags=artist,title', '-of', 'json', fullPath], (err, stdout) => {
@@ -166,20 +189,19 @@ app.post('/process', async (req, res) => {
     const ffmpegArgs = ['-loglevel', 'error', '-i', fullPath];
 
     // Add specific ffmpeg arguments based on the action
-    if (action === 'seek' || action === 'skip') {
+    if ((action === 'seek' || action === 'skip' || action === 'speed') && startTime > 0) {
       ffmpegArgs.push('-ss', startTime / 1000);
     }
-    if (action === 'speed') {
+    if (action === 'speed' && speed !== 1) {
       ffmpegArgs.push('-filter:a', `atempo=${speed}`);
-    }
-
-    ffmpegArgs.push('-vn', '-b:a', '192k', '-c:a', 'copy', tempFilePath);
-
+    } 
+    ffmpegArgs.push('-vn', '-b:a', '192k', '-c:a', 'libmp3lame', tempFilePath);
+    
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
 
     ffmpeg.on('close', (code) => {
       if (code === 0) {
-        res.json({ path.basename(tempFilePath), originalFilePath: path.basename(fullPath) }); // Include originalFilePath in the response
+        res.json({ tempFilePath: path.basename(tempFilePath), originalFilePath: path.basename(fullPath) }); // Include originalFilePath in the response
       } else {
         console.error('Error processing file with ffmpeg');
         res.status(500).json({ error: 'Failed to process file' });
