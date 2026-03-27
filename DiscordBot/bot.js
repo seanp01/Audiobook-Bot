@@ -1,4 +1,4 @@
-﻿const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder } = require('discord.js');
+﻿const { Client, Collection, GatewayIntentBits, Partials, ActionRowBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ContainerBuilder, TextDisplayBuilder, MediaGalleryBuilder, MediaGalleryItemBuilder, MessageFlags } = require('discord.js');
 const express = require('express');
 const path = require('path');
 const colors = require('colors'); 
@@ -6,12 +6,10 @@ const fs = require('fs');
 const wol = require('wake_on_lan');
 const axios = require('axios');
 const { SlashCommandBuilder } = require('@discordjs/builders');
-const { REST } = require('@discordjs/rest');
 const { exec, spawn, fork, execFile } = require('child_process');
-const { Routes } = require('discord-api-types/v9');
 const { joinVoiceChannel, createAudioPlayer, getVoiceConnection, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
 const { v4: uuidv4 } = require('uuid');
-const { saveCache, getAudiobookTitleFromFile, getUserBooksInProgress, loadUserPositions, scheduleUserPositionSaving, listAudiobooks, getM4BCoverImage, getM4BMetaData, findClosestTitleFile, getFileNameFromTitle, skipAudiobook, retrieveAudiobookFilePaths, selectAudiobookAndRetrievePaths, updateAudiobookCache, getUserPosition, } = require('./utils/smbAccess');
+const { saveCache, getAudiobookTitleFromFile, getUserBooksInProgress, loadUserPositions, scheduleUserPositionSaving, listAudiobooks, getM4BCoverImage, getM4BMetaData, findClosestTitleFile, getFileNameFromTitle, skipAudiobook, retrieveAudiobookFilePaths, selectAudiobookAndRetrievePaths, updateAudiobookCache, getUserPosition, getAudiobookAutocompleteChoices, } = require('./utils/smbAccess');
 const os = require('os');
 const { time } = require('console');
 require('dotenv').config({ path: path.resolve(__dirname, '.env') }); // Explicitly load .env from the DiscordBot directory
@@ -34,7 +32,7 @@ const streamPalToken = process.env.MASTER_BOT_TOKEN;
 
 // Network addresses
 const macAddress = process.env.MAC_ADDRESS;
-const MediaPCMacAddress = process.env.MEDIA_MAC_ADDRESS;
+const mediaPCMacAddress = process.env.MEDIA_MAC_ADDRESS;
 const mediaPIIPAddress = process.env.MEDIA_PI_ADDRESS;
 const hdAndroidIPAddress = process.env.HD_ANDROID_IP_ADDRESS;
 const udhAndroidIPAddress = process.env.UDH_ANDROID_IP_ADDRESS; 
@@ -55,7 +53,7 @@ const downloadPort = process.env.DOWNLOAD_PORT; // Port for the file hosting ser
 const networkPath = process.env.NETWORK_PATH;
 const smbDrive = process.env.REMOTE_DRIVE_LETTER;
 const networkUsername = process.env.NETWORK_USERNAME; // Replace with your network username
-const networkPassword = process.env.NETOWRK_PASSWORD; // Replace with your network password
+const networkPassword = process.env.NETWORK_PASSWORD; // Replace with your network password
 
 const audioDurationCache = new Map();
 
@@ -83,7 +81,6 @@ const userCurrentChapter = new Map();
 const userCurrentPart = new Map();
 const userTimestamps = new Map();
 const userUiMessageData = new Map(); // Map to store { channelId, messageId }
-const userPositionsCache = new Map(); // Cache for user positions
 const userIntervals = new Map();
 const minionConnections = new Map(); // Map to store connections for each minion bot
 const minionProcesses = new Map();
@@ -142,15 +139,6 @@ const AudiobookCommands = {
   SEARCH: 'search',
   AUDIOBOOK: 'audiobook',
   AUDIOBOOK_LIBRARY: 'audiobook-library',
-  AUDIOBOOK_PLAY: 'audiobook-play',
-  AUDIOBOOK_PAUSE: 'audiobook-pause',
-  AUDIOBOOK_FF: 'audiobook-ff',
-  AUDIOBOOK_RW: 'audiobook-rw',
-  AUDIOBOOK_SKIP: 'audiobook-skip',
-  AUDIOBOOK_BACK: 'audiobook-back',
-  AUDIOBOOK_NEXT_CHAPTER: 'audiobook-next-chapter',
-  AUDIOBOOK_PREV_CHAPTER: 'audiobook-prev-chapter',
-  AUDIOBOOK_SPEED: 'audiobook-speed',
   AUDIOBOOK_IN_PROGRESS: 'audiobook-in-progress',
   DOWNLOAD: 'download'
 };
@@ -258,30 +246,84 @@ const firestickKeyEventCodes = {
   APPS: 'input keyevent 82',
 }
 
+function getAutocompleteCommandDefinitions() {
+  return [
+    new SlashCommandBuilder()
+      .setName(AudiobookCommands.AUDIOBOOK)
+      .setDescription('Play an audiobook selection')
+      .addStringOption((option) =>
+        option
+          .setName('title')
+          .setDescription('Name of audiobook to play')
+          .setRequired(true)
+          .setAutocomplete(true)
+      ),
+    new SlashCommandBuilder()
+      .setName(AudiobookCommands.AUDIOBOOK_LIBRARY)
+      .setDescription('Navigate or search the audiobook library')
+      .addStringOption((option) =>
+        option
+          .setName('query')
+          .setDescription('Search for a title')
+          .setRequired(false)
+          .setAutocomplete(true)
+      ),
+  ];
+}
+
+async function registerOrUpdateGuildCommands(guild, commandBuilders) {
+  const existingCommands = await guild.commands.fetch();
+  const localCommands = new Set(Object.values(AudiobookCommands));
+  const managedCommandData = commandBuilders.map((builder) => builder.toJSON());
+  const managedCommandNames = new Set(managedCommandData.map((command) => command.name));
+
+  const preservedCommandData = existingCommands
+    .filter((command) => localCommands.has(command.name) && !managedCommandNames.has(command.name))
+    .map((command) => {
+      const serialized = command.toJSON();
+      delete serialized.id;
+      delete serialized.application_id;
+      delete serialized.guild_id;
+      delete serialized.version;
+      return serialized;
+    });
+
+  await guild.commands.set([
+    ...preservedCommandData,
+    ...managedCommandData,
+  ]);
+}
+
+async function handleAudiobookAutocomplete(interaction) {
+  try {
+    const focusedOption = interaction.options.getFocused(true);
+
+    if (!focusedOption || !['title', 'query'].includes(focusedOption.name)) {
+      await interaction.respond([]);
+      return;
+    }
+
+    const choices = await getAudiobookAutocompleteChoices(focusedOption.value, 25);
+    await interaction.respond(choices);
+  } catch (error) {
+    console.error('Autocomplete handler failed:', error);
+    if (!interaction.responded) {
+      await interaction.respond([]);
+    }
+  }
+}
+
 const masterBot = new Client({
-  messageCache: 60,
-  fetchAllMembers: false,
-  messageCacheMaxSize: 10,
-  restTimeOffset: 0,
-  restWsBridgetimeout: 100,
-  disableEveryone: true,
   intents: [    
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildBans,
-    GatewayIntentBits.GuildEmojisAndStickers,
-    GatewayIntentBits.GuildIntegrations,
-    GatewayIntentBits.GuildWebhooks,
-    GatewayIntentBits.GuildInvites,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildPresences,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
-    GatewayIntentBits.GuildMessageTyping,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.DirectMessageReactions,
-    GatewayIntentBits.DirectMessageTyping
   ], 
   partials: [
     Partials.Channel,
@@ -290,51 +332,21 @@ const masterBot = new Client({
   ] 
 });
 
-masterBot.once('ready', async () => {
+masterBot.once('clientReady', async () => {
   guild = await masterBot.guilds.cache.get(guildID);
   if (!guild) {
     console.log('Guild not found');
     return;
   }
-  // Use the enum for local command values
-  const localCommands = new Set(Object.values(AudiobookCommands));
-  // Delete commands that are not found in the folder
-  const rest = new REST({ version: '9' }).setToken(process.env.MASTER_BOT_TOKEN);
-  try {
-    const commands = await rest.get(
-      Routes.applicationGuildCommands(streamboiAppID, guildID)
-    );
-
-    for (const command of commands) {
-      if (!localCommands.has(command.name)) {
-        await rest.delete(
-          `${Routes.applicationGuildCommands(streamboiAppID, guildID)}/${command.id}`
-        );
-        console.log(`Deleted command: ${command.name}`);
-      }
-    }
-  } catch (error) {
-    console.error(error);
-  }
-
-  // Register (or update) new commands
-  const commandsToRegister = [
-      //new SlashCommandBuilder().setName('download').setDescription('Downloads a file from the network drive'),
-      // new SlashCommandBuilder().setName(Commands.AUDIOBOOK).setDescription('Plays an audiobook selection')
-      //     .addStringOption(option => option.setName('title').setDescription('Name of audiobook to play').setRequired(true)),
-      // new SlashCommandBuilder().setName(Commands.AUDIOBOOK_IN_PROGRESS).setDescription('Lists audiobooks in progress'),
-      // new SlashCommandBuilder().setName(Commands.AUDIOBOOK_LIBRARY).setDescription('Navigate the audiobook library'),
-  ];
-
-   for (const command of commandsToRegister) {
-     await guild.commands.create(command.toJSON());
-   }
+  // Register or update managed commands and prune stale non-local slash commands.
+  const commandsToRegister = getAutocompleteCommandDefinitions();
+  await registerOrUpdateGuildCommands(guild, commandsToRegister);
   try {
     const members = await guild.members.fetch();
     onlineMembers = members.filter(member => member.presence?.status === 'online');
     const onlineMemberNames = onlineMembers.map(member => member.user.username).join(', ');
     console.log(`Online members: ${onlineMemberNames}`);
-    loadUserPositions();
+    // User positions are already loaded at module initialization in smbAccess.js
   } catch (error) {
     if (error.code === 'GuildMembersTimeout') {
       console.error('Failed to fetch guild members in time.');
@@ -344,9 +356,13 @@ masterBot.once('ready', async () => {
   }
   await checkAndMountNetworkDrive();
   audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
-  await loadUserPositionsCache(); // Load user positions from file
+  // User positions are now managed entirely by utils/smbAccess.js
   //console.log('Master bot is ready. Launching DVR bot...');
-  bootupDVRBot();
+
+  // TODO: Enable other bots as needed
+  //bootupDVRBot();
+  //bootupSportsBot();
+
   //bootupYouTubeBuddyBot();
   //await refreshAudiblePlusTitles();
 
@@ -361,7 +377,12 @@ masterBot.once('ready', async () => {
 
 masterBot.on('interactionCreate', async (interaction) => {
   try {
-    if (!interaction.isCommand() && !interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
+    if (interaction.isAutocomplete()) {
+      await handleAudiobookAutocomplete(interaction);
+      return;
+    }
+
+    if (!interaction.isChatInputCommand() && !interaction.isButton() && !interaction.isStringSelectMenu() && !interaction.isModalSubmit()) return;
 
     // Helper function to update the UI message
     const updateUIMessage = async (content) => {
@@ -429,14 +450,17 @@ masterBot.on('interactionCreate', async (interaction) => {
       const coverImagePath = coverResponse.data.coverImagePath;
       const coverImageUrl = getDynamicCoverImageUrl(path.basename(path.normalize(coverImagePath)));
 
-      const embed = new EmbedBuilder()
-        .setTitle(reviewTitle)
-        .setDescription(reviewText)
-        .addFields({ name: 'Rating', value: '⭐'.repeat(rating) })
-        .setColor('#0099ff')
-        .setFooter({ text: `Review by ${interaction.user.tag}` })
-        .setThumbnail(coverImageUrl) // Add the cover image
-        .setTimestamp();
+      const reviewContainer = buildContainerCard({
+        title: reviewTitle,
+        bodyLines: [
+          reviewText,
+          `**Rating:** ${'⭐'.repeat(Number(rating))}`,
+          `**Review by:** ${interaction.user.tag}`,
+          `**Submitted:** <t:${Math.floor(Date.now() / 1000)}:F>`,
+        ],
+        imageUrl: coverImageUrl,
+        accentColor: 0x0099ff,
+      });
 
       const channel = interaction.guild.channels.cache.find((ch) => ch.name === 'book-ratings');
       if (!channel) {
@@ -445,13 +469,32 @@ masterBot.on('interactionCreate', async (interaction) => {
       }
 
       // Post the review
-      await channel.send({ embeds: [embed] });
+      await channel.send({
+        flags: MessageFlags.IsComponentsV2,
+        components: [reviewContainer],
+      });
 
       // Re-send the "Add Book Review" button
       await ensureAddReviewButton(channel);
 
       // Acknowledge the modal submission
       await interaction.reply({ content: 'Your review has been submitted!', ephemeral: true });
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'library_search_modal') {
+      const searchQuery = interaction.fields.getTextInputValue('library_search_query')?.trim();
+
+      if (!searchQuery) {
+        await interaction.reply({
+          content: 'Search query cannot be empty.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+      await showSearchResults(interaction, searchQuery);
+      return;
     }
 
     if (interaction.commandName == "download") {
@@ -514,7 +557,7 @@ masterBot.on('interactionCreate', async (interaction) => {
       });
     }
 
-    if (interaction.isCommand()) {
+    if (interaction.isChatInputCommand()) {
       const command = interaction.commandName;
 
       switch (command) {
@@ -534,14 +577,22 @@ masterBot.on('interactionCreate', async (interaction) => {
           break;
         case AudiobookCommands.AUDIOBOOK:
           console.log('User requested audio book playback');
-          await interaction.deferReply({ ephemeral: true }); 
-          let fileName = await findClosestTitleFile(interaction.options.getString('title'));
-          let booktTitle = await getAudiobookTitleFromFile(fileName);
-          await executeAudiobookCommand(interaction, bookTitle.replace(' (Unabridged)', '').split(':')[0]); // Use the original title in the command
+          await interaction.deferReply({ ephemeral: true });
+          const selectedTitle = interaction.options.getString('title');
+          if (!selectedTitle) {
+            await interaction.editReply('Please provide an audiobook title.');
+            break;
+          }
+          await executeAudiobookCommand(interaction, selectedTitle.replace(' (Unabridged)', '').split(':')[0]);
           break;
         case AudiobookCommands.AUDIOBOOK_LIBRARY:
           await interaction.deferReply();
-          await showLibraryMenu(interaction);
+          const searchQuery = interaction.options.getString('query');
+          if (searchQuery && searchQuery.trim()) {
+            await showSearchResults(interaction, searchQuery.trim());
+          } else {
+            await showLibraryMenu(interaction);
+          }
           break;
         case AudiobookCommands.AUDIOBOOK_IN_PROGRESS:
           await interaction.deferReply({ ephemeral: true });
@@ -699,15 +750,16 @@ masterBot.on('interactionCreate', async (interaction) => {
         return;
       }
       if (command.startsWith('remove_')) {
-        const bookTitle = command.replace('remove_', '');
+        // The title from the button is already normalized
+        const normalizedTitle = command.replace('remove_', '');
   
         // Ask for confirmation
         await interaction.reply({
-          content: `Are you sure you want to remove "${bookTitle}" from your in-progress list?`,
+          content: `Are you sure you want to remove "${normalizedTitle}" from your in-progress list?`,
           components: [
             new ActionRowBuilder().addComponents(
               new ButtonBuilder()
-                .setCustomId(`confirm_remove_${bookTitle}`)
+                .setCustomId(`confirm_remove_${normalizedTitle}`)
                 .setLabel('Yes')
                 .setStyle(ButtonStyle.Danger),
               new ButtonBuilder()
@@ -719,71 +771,60 @@ masterBot.on('interactionCreate', async (interaction) => {
           ephemeral: true,
         });
       } else if (command.startsWith('confirm_remove_')) {
-        const bookTitle = command.replace('confirm_remove_', '');
+        // The title is already normalized
+        const normalizedTitle = command.replace('confirm_remove_', '');
         const userId = interaction.user.id;
   
-        // Remove the book from the user's position cache
-        if (!userPositionsCache[userId]) {
-          await loadUserPositionsCache();
+        try {
+          console.log(`[confirm_remove] User ${userId} confirming removal of "${normalizedTitle}"`);
+          // Use the normalized title directly
+          const { removeUserPosition } = require('./utils/smbAccess');
+          await removeUserPosition(userId, normalizedTitle);
+          
+          await interaction.update({
+            content: `"${normalizedTitle}" has been removed from your in-progress list.`,
+            components: [],
+          });
+          console.log(`[confirm_remove] UI updated successfully`);
+        } catch (error) {
+          console.error('[confirm_remove] Error removing book:', error);
+          await interaction.update({
+            content: `Failed to remove "${normalizedTitle}". Please try again.`,
+            components: [],
+          });
         }
-        const userPositions = userPositionsCache[userId] || {};
-        delete userPositions[bookTitle];
-        userPositionsCache[userId] = userPositions;
-  
-        // Persist the changes to the file
-        await syncPositionsToFile();
-  
-        await interaction.update({
-          content: `"${bookTitle}" has been removed from your in-progress list.`,
-          components: [],
-        });
       } else if (command === 'cancel_remove') {
         await interaction.update({
           content: 'Action canceled.',
           components: [],
         });
       }
-      if (!command.startsWith('resume_') && !interaction.replied && !interaction.deferred) await interaction.deferUpdate(); // Defer the reply to acknowledge the interaction
+      if (!command.startsWith('resume_') && command !== 'library_search' && !interaction.replied && !interaction.deferred) await interaction.deferUpdate(); // Defer the reply to acknowledge the interaction
 
       if (command.startsWith('resume_')) {
-        const rawTitle = command.replace('resume_', '');
-        const normalizedTitle = rawTitle.replaceAll('_', ' ').replace(' (Unabridged)', '').split(':')[0];
+        // The title from the button is already normalized (no underscores, no (Unabridged), no subtitle)
+        const normalizedTitle = command.replace('resume_', '');
         if (interaction.replied) await interaction.editReply(`Loading ${normalizedTitle}...`); // Delete the previous reply if it exists
         else if (!interaction.replied && !interaction.deferred) await interaction.reply(`Loading ${normalizedTitle}...`); // Show the loading message
-        const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
-        if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
-        const originalTitle = audiobooks.find((book) => book.title.toLowerCase().includes(normalizedTitle.toLowerCase()))?.title;
-        // Execute the audiobook command to start a new session
-        await executeAudiobookCommand(interaction, originalTitle.replace(' (Unabridged)', '').split(':')[0]); // Use the original title in the command
+        // Pass the normalized title directly to executeAudiobookCommand
+        await executeAudiobookCommand(interaction, normalizedTitle);
       } else if (command === 'library_search') {
-        // Prompt the user for a search query
-        await interaction.followUp({
-          content: 'Please enter your search query:',
-          ephemeral: true, // Only visible to the user
-        });
+        const modal = new ModalBuilder()
+          .setCustomId('library_search_modal')
+          .setTitle('Search Audiobook Library')
+          .addComponents(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId('library_search_query')
+                .setLabel('Title or keyword')
+                .setPlaceholder('Example: dungeon crawler carl')
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+            )
+          );
 
-        // Wait for the user's response
-        const filter = (response) => response.author.id === interaction.user.id;
-        const collected = await interaction.channel.awaitMessages({
-          filter,
-          max: 1,
-          time: 30000, // 30 seconds timeout
-          errors: ['time'],
-        }).catch(() => null);
-
-        if (!collected || collected.size === 0) {
-          await interaction.followUp({
-            content: 'You did not provide a search query in time.',
-            ephemeral: true,
-          });
-          return;
-        }
-
-        const searchQuery = collected.first().content.trim();
-        await collected.first().delete(); // Delete the user's message for cleanliness
-
-        // Perform the search
-        await showSearchResults(interaction, searchQuery);
+        await interaction.showModal(modal);
+        return;
       } else if (command.startsWith('library_browse_all')) {
         const page = parseInt(command.split('_').pop(), 10) || 0;
         await showBrowseAllMenu(interaction, page);
@@ -807,11 +848,14 @@ masterBot.on('interactionCreate', async (interaction) => {
       } else if (command.startsWith('library_back')) {
         await showLibraryMenu(interaction);
       } else if (command.startsWith('start_or_resume')) {
-        const bookTitle = command.replace('start_or_resume_', '').split('_')[0].replace(' (Unabridged)', '').split(':')[0];
-        const normalizedTitle = normalizeTitle(bookTitle);
+        const payload = command.replace('start_or_resume_', '');
+        const payloadParts = payload.split('_');
+        const bookTitle = payloadParts.length >= 3
+          ? payloadParts.slice(0, -2).join('_')
+          : payload;
         const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
         if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
-        const originalTitle = audiobooks.find((book) => normalizeTitle(book.title).includes(normalizedTitle))?.title.replace(' (Unabridged)', '').split(':')[0];
+        const originalTitle = resolveAudiobookTitle(bookTitle, audiobooks);
 
         await executeAudiobookCommand(interaction, originalTitle);
       } else if (command.startsWith('search_results_')) {
@@ -859,9 +903,22 @@ masterBot.on('voiceStateUpdate', async (oldState, newState) => {
       }, 2000);
     }
     if (newState.member.user.bot || newUserChannel == oldUserChannel) return; // Ignore bot users
+
     // Check if the user joined a voice channel
     if (newUserChannel && newUserChannel.name.startsWith('private-session-')) {
       console.log(`User ${newState.member.user.tag} joined voice channel ${newUserChannel.name}`);
+
+      // Delete the previous welcome message if it's the most recent message
+      try {
+        const messages = await newUserChannel.messages.fetch({ limit: 1 });
+        const lastMessage = messages.first();
+        if (lastMessage && lastMessage.author.id === masterBot.user.id && lastMessage.content.includes('Welcome to your private session')) {
+          await lastMessage.delete();
+          console.log('Deleted previous welcome message from the channel.');
+        }
+      } catch (error) {
+        console.error('Error checking or deleting previous welcome message:', error);
+      }
 
       // Send the library menu in the associated text channel
       await newUserChannel.send({
@@ -871,9 +928,17 @@ masterBot.on('voiceStateUpdate', async (oldState, newState) => {
       // Use the showLibraryMenu function to send the buttons
       await showLibraryMenu({
         editReply: async (data) => {
+          const messagePayload = {
+            flags: data.flags,
+            components: data.components || [],
+          };
+
+          if (typeof data.content === 'string') {
+            messagePayload.content = data.content;
+          }
+
           await newUserChannel.send({
-            content: data.content, // The message content
-            components: data.components || [], // The components (e.g., buttons, select menus)
+            ...messagePayload,
           });
         },
       });
@@ -896,7 +961,7 @@ masterBot.on('voiceStateUpdate', async (oldState, newState) => {
     if (oldUserChannel === null && newUserChannel !== null && newUserChannel.name === 'horde-cast') {
       console.log(`User ${newState.member?.user.tag} joined voice channel ${newUserChannel.name}`);
       if (!streampalonline) {
-        wol.wake(MediaPCMacAddress, function (error) {
+        wol.wake(mediaPCMacAddress, function (error) {
           if (error) {
             console.log('Wake-on-LAN error', error);
           } else {
@@ -948,6 +1013,9 @@ async function bootupYouTubeBuddyBot() {
   });
 }
 
+/**
+ * Boot up the DVR bot as a separate process and restart it if it exits.
+ */
 async function bootupDVRBot() {
   const dvrBotPath = path.join(__dirname, 'dvrBot', 'dvrQueueBot.js');
   const dvrBotProcess = fork(dvrBotPath, [], { stdio: 'inherit' });
@@ -958,6 +1026,23 @@ async function bootupDVRBot() {
   });
 }
 
+/**
+ * Boot up the Sports bot as a separate process and restart it if it exits.
+ */
+async function bootupSportsBot() {
+  const sportsBotPath = path.join(__dirname, 'sportsBot', 'sportsBot.js');
+  const sportsBotProcess = fork(sportsBotPath, [], { stdio: 'inherit' });
+
+  sportsBotProcess.on('exit', async (code) => {
+    console.log(`Sports bot exited with code ${code}`);
+    await bootupSportsBot();
+  });
+}
+
+/**
+ * Send a command to the Android device via ADB.
+ * @param {*} command 
+ */
 async function sendADBCommand(command) {
   await spawn(`adb shell input keyevent 3`);
   const adbProcess = spawn('adb', ['-s', hdAndroidIPAddress, 'shell', command]);
@@ -974,6 +1059,9 @@ async function sendADBCommand(command) {
   });
 }
 
+/**
+ * Restart the ADB connection to the Android device.
+ */
 async function restartADBConnection() {
   // Restart the ADB server
   const killADBProcess = spawn('adb', ['kill-server']);
@@ -991,6 +1079,9 @@ async function restartADBConnection() {
   await establishADBConnection(); // Re-establish the ADB connection
 }
 
+/**
+ * Establish a new ADB connection to the Android device.
+ */
 async function establishADBConnection() {
   //Establish a new ADB connection
   const adbProcess = spawn('adb', ['connect', hdAndroidIPAddress]);
@@ -1005,6 +1096,10 @@ async function establishADBConnection() {
   });
 }
 
+/**
+ * Resend the remote control UI message in the specified channel.
+ * @param {*} interaction 
+ */
 async function resendRemoteControlMessage(interaction) {
   if (remoteControlMessageData) {
     // Delete the old message if it exists
@@ -1019,6 +1114,10 @@ async function resendRemoteControlMessage(interaction) {
   }
 }
 
+/**
+ * Send the remote control UI message in the specified channel.
+ * @param {*} newUserChannel 
+ */
 async function sendRemoteControlUIMessage(newUserChannel) {
     // Establish communication with the adb service and ensure the remote control UI is present.
     const row1 = new ActionRowBuilder()
@@ -1065,60 +1164,19 @@ async function sendRemoteControlUIMessage(newUserChannel) {
     new ButtonBuilder().setCustomId(adbRemoteCommands.SETTINGS).setEmoji('<:settings:1365423441393487884>').setStyle(ButtonStyle.Secondary)
     );
 
+    const remoteHeader = buildMenuHeader('Horde Cast Remote <:remote_signal:1365757425436725389>', [
+      'Use the directional pad, home/menu buttons, and shortcuts below to control the stream device.',
+    ], 0x5865f2);
+
     // Save the message data
     remoteControlMessageData = {
-      content: '### Horde Cast Remote <:remote_signal:1365757425436725389>\n\n~~                                                             ~~',
-      components: [row1, row2, row3, row4, row5],
+      flags: MessageFlags.IsComponentsV2,
+      components: [remoteHeader, row1, row2, row3, row4, row5],
     };
 
-    remoteControlUIMessage = await newUserChannel.send({ content: '### Horde Cast Remote <:remote_signal:1365757425436725389>\n\n~~                                                             ~~', components: [row1, row2, row3, row4, row5] });
+    remoteControlUIMessage = await newUserChannel.send(remoteControlMessageData);
 
     // TODO: Add support for adb remote command recording sessions for gathering keypress mappings.
-}
-
-let isSyncingPositions = false; // Flag to prevent concurrent sync operations
-
-async function syncPositionsToFile() {
-  if (isSyncingPositions) {
-    return; // Exit if the function is already running
-  }
-  isSyncingPositions = true; // Set the lock
-  try {
-    let existingData = {};
-
-    // Merge the cached data with the existing data
-    for (const userID of Object.keys(userPositionsCache)) {
-      const userAudiobooks = userPositionsCache[userID];
-    
-      // Ensure the user exists in existingData
-      if (!existingData[userID]) {
-        existingData[userID] = {}; // Initialize the user entry
-      }
-    
-      for (const [audiobookTitle, positionData] of Object.entries(userAudiobooks)) {
-        if (!audiobookTitle || typeof audiobookTitle !== 'string') {
-          console.warn(`Skipping invalid audiobook title for user ${userID}:`, audiobookTitle);
-          continue; // Skip invalid titles
-        }
-    
-        // Add or update the audiobook position data
-        existingData[userID][audiobookTitle] = positionData;
-      }
-    }
-
-    // Skip writing if there is no data
-    if (Object.keys(existingData).length === 0) {
-      console.warn('No data to write. Skipping file update.');
-      return;
-    }
-
-    // Write the updated data back to the file
-    fs.writeFileSync(userPositionFilePath, JSON.stringify(existingData, null, 2));
-  } catch (error) {
-    console.error('Error syncing positions to file:', error);
-} finally {
-    isSyncingPositions = false; // Release the lock
-  }
 }
 
 let isApplicationGridVisible = false; // Flag to track if the grid is visible
@@ -1127,6 +1185,9 @@ let focusCol = 0; // Column index of the focused emoji
 let page = 0; // Current page number
 let gridMessage = null; // Variable to store the message object
 
+/**
+ * Display the emoji grid for application selection.
+ */
 async function showEmojiGrid(interaction, focusRow = 0, focusCol = 0, page = 0) {
   try {
     const gridSize = 2; // Number of columns in the grid
@@ -1185,18 +1246,21 @@ async function showEmojiGrid(interaction, focusRow = 0, focusCol = 0, page = 0) 
         .setDisabled(page === totalPages - 1) // Disable "Next" on the last page
     );
 
-    // Send or edit the grid message
     const gridContent = grid.join('\n'); // Join rows with newlines
+    const gridContainer = buildMenuHeader('Application Grid', [
+      `Page ${page + 1} of ${totalPages}`,
+      gridContent,
+    ], 0x5865f2);
+
+    // Send or edit the grid message
     if (gridMessage !== null) {
       await gridMessage.edit({
-        content: `${gridContent}`,
-        components: [navigationButtons],
+        components: [gridContainer, navigationButtons],
       });
     } else {
       gridMessage = await interaction.channel.send({
-        content: `${gridContent}`,
-        components: [navigationButtons],
-        ephemeral: true, // Make the message visible only to the user
+        flags: MessageFlags.IsComponentsV2,
+        components: [gridContainer, navigationButtons],
       });
       await resendRemoteControlMessage(interaction); // Resend the remote control message
     }
@@ -1206,11 +1270,19 @@ async function showEmojiGrid(interaction, focusRow = 0, focusCol = 0, page = 0) 
   }
 }
 
+async function editReplyAsV2Text(interaction, text, accentColor = 0x5865f2) {
+  await interaction.editReply({
+    flags: MessageFlags.IsComponentsV2,
+    components: [buildTextContainer(text, accentColor)],
+  });
+}
+
+/**
+ * Show search results for audiobooks based on the search query.
+ */
 async function showSearchResults(interaction, searchQuery, page = 0) {
   try {
-    await interaction.editReply({
-      content: `Loading results for '${searchQuery}'...`
-    });
+    await editReplyAsV2Text(interaction, `Loading results for '${searchQuery}'...`);
     const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
     if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
 
@@ -1220,10 +1292,15 @@ async function showSearchResults(interaction, searchQuery, page = 0) {
     );
 
     if (searchResults.length === 0) {
-      await interaction.editReply({
-        content: `No audiobooks found for the search query: "${searchQuery}"`,
-        ephemeral: true,
-      });
+      const suggestions = await getAudiobookAutocompleteChoices(searchQuery, 5);
+      const suggestionLines = suggestions.map((suggestion) => `- ${suggestion.name}`);
+
+      await editReplyAsV2Text(
+        interaction,
+        suggestionLines.length > 0
+          ? `No audiobooks found for: "${searchQuery}"\n\nSuggestions from your local library cache:\n${suggestionLines.join('\n')}`
+          : `No audiobooks found for the search query: "${searchQuery}"`
+      );
       return;
     }
 
@@ -1270,39 +1347,28 @@ async function showSearchResults(interaction, searchQuery, page = 0) {
 
     // Send the search results
     await interaction.editReply({
-      content: `Search Results for: "${searchQuery}" (Page ${page + 1} of ${Math.ceil(searchResults.length / resultsPerPage)}):`,
-      components: rows,
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        buildMenuHeader('Search Results', [
+          `**Query:** ${searchQuery}`,
+          `**Page:** ${page + 1} of ${Math.ceil(searchResults.length / resultsPerPage)}`,
+          `**Matches:** ${searchResults.length}`,
+        ]),
+        ...rows,
+      ],
     });
   } catch (error) {
     console.error('Error showing search results:', error);
-    await interaction.editReply({
-      content: 'An error occurred while searching for audiobooks.',
-      ephemeral: true,
-    });
+    await editReplyAsV2Text(interaction, 'An error occurred while searching for audiobooks.');
   }
 }
 
-async function loadUserPositionsCache() {
-  try {
-    if (fs.existsSync(userPositionFilePath)) {
-      const fileData = fs.readFileSync(userPositionFilePath, 'utf-8');
-      if (fileData.trim()) {
-        const existingData = JSON.parse(fileData);
-        for (const [userID, userAudiobooks] of Object.entries(existingData)) {
-          userPositionsCache[userID] = userAudiobooks; // Load the user positions into the cache
-        }
-      } 
-    } 
-  } catch (error) {
-    console.error('loadUserPositionsCache: Error loading user positions from file:', error);
-  }
-}
-
+/**
+ * Show books by a specific author with pagination.
+ */
 async function showAuthorBooksMenu(interaction, author, page = 0) {
   try {
-    await interaction.editReply({
-      content: `Loading books by ${author}...`
-    });
+    await editReplyAsV2Text(interaction, `Loading books by ${author}...`);
     const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
     if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
 
@@ -1311,7 +1377,7 @@ async function showAuthorBooksMenu(interaction, author, page = 0) {
     const paginatedBooks = authorBooks.slice(page * 10, (page + 1) * 10);
 
     if (paginatedBooks.length === 0) {
-      await interaction.editReply(`No books found for the author: ${author}`);
+      await editReplyAsV2Text(interaction, `No books found for the author: ${author}`);
       return;
     }
 
@@ -1354,20 +1420,31 @@ async function showAuthorBooksMenu(interaction, author, page = 0) {
 
     // Send the updated message
     await interaction.editReply({
-      content: `Books by Author: ${author} (Page ${page + 1}):`,
-      components: rows,
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        buildMenuHeader('Author Books', [
+          `**Author:** ${author}`,
+          `**Page:** ${page + 1}`,
+          `**Results:** ${authorBooks.length}`,
+        ]),
+        ...rows,
+      ],
     });
   } catch (error) {
     console.error('Error showing author books menu:', error);
-    await interaction.editReply('An error occurred while loading books for this author.');
+    await editReplyAsV2Text(interaction, 'An error occurred while loading books for this author.');
   }
 }
 
+/**
+ * Show the authors menu with pagination.
+ * @param {*} interaction 
+ * @param {*} page 
+ * @returns {Promise<void>}
+ */
 async function showAuthorsMenu(interaction, page = 0) {
   try {
-    await interaction.editReply({
-      content: `Loading Authors...`
-    });
+    await editReplyAsV2Text(interaction, 'Loading Authors...');
     const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
     if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
 
@@ -1375,7 +1452,7 @@ async function showAuthorsMenu(interaction, page = 0) {
     const authors = [...new Set(audiobooks.map((book) => book.author))].sort();
 
     if (authors.length === 0) {
-      await interaction.editReply('No authors found in the audiobook library.');
+      await editReplyAsV2Text(interaction, 'No authors found in the audiobook library.');
       return;
     }
 
@@ -1420,15 +1497,24 @@ async function showAuthorsMenu(interaction, page = 0) {
 
     // Send the paginated authors menu
     await interaction.editReply({
-      content: `Select an Author (Page ${page + 1} of ${Math.ceil(authors.length / resultsPerPage)}):`,
-      components: rows,
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        buildMenuHeader('Authors', [
+          `**Page:** ${page + 1} of ${Math.ceil(authors.length / resultsPerPage)}`,
+          `**Available Authors:** ${authors.length}`,
+        ]),
+        ...rows,
+      ],
     });
   } catch (error) {
     console.error('Error showing authors menu:', error);
-    await interaction.editReply('An error occurred while loading authors.');
+    await editReplyAsV2Text(interaction, 'An error occurred while loading authors.');
   }
 }
 
+/**
+ * Send interaction data to the specified minion bot for audiobook playback.
+ */
 async function sendInteractionToMinion(minion, playbackData, commandType = 'playback') {
   try {
     const minionProcess = minionProcesses.get(minion.id);
@@ -1449,6 +1535,9 @@ async function sendInteractionToMinion(minion, playbackData, commandType = 'play
   }
 }
 
+/**
+ * Update the message data for the user's UI interaction.
+ */
 async function updateMessageData(interaction) {
   const userId = interaction.user.id;
 
@@ -1475,15 +1564,17 @@ async function updateMessageData(interaction) {
 }
 
 const userMinionMap = new Map(); // Map to track which minion is assigned to each user
-
+/**
+ * Execute the audiobook command for the user.
+ */
 async function executeAudiobookCommand(interaction, bookTitle = null) {
   try {
     const userId = interaction.user.id;
     const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
     if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
 
-    // Use the original title for storage
-    const originalTitle = audiobooks.find((book) => book.title.toLowerCase().includes(bookTitle.toLowerCase()))?.title || bookTitle;
+    // Resolve to a canonical title using exact normalized matching first.
+    const originalTitle = resolveAudiobookTitle(bookTitle, audiobooks);
     let normalizedTitle = originalTitle.replace(' (Unabridged)', '').split(':')[0]; // Normalize the title for display
     // Check if the book is already in progress
     const userPosition = getUserPosition(userId, normalizedTitle);
@@ -1560,6 +1651,9 @@ async function executeAudiobookCommand(interaction, bookTitle = null) {
   }
 }
 
+/**
+ * Show the main library menu with options.
+ */
 async function showLibraryMenu(interaction) {
   const buttons = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -1585,19 +1679,23 @@ async function showLibraryMenu(interaction) {
   );
 
   await interaction.editReply({
-    content: 'Audiobook Library Menu:',
-    embeds: [], // No embeds for this menu
-    components: [buttons],
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      buildMenuHeader('Audiobook Library', [
+        'Browse the full catalog, filter by genre or author, search titles, or jump back into an in-progress book.',
+      ]),
+      buttons,
+    ],
   });
 }
 
 let audiobookCache;
-
+/**
+ * Show the "Browse All" audiobooks menu with pagination.
+ */
 async function showBrowseAllMenu(interaction, page) {
   try {
-    await interaction.editReply({
-      content: `Loading library...`
-    });
+    await editReplyAsV2Text(interaction, 'Loading library...');
     if (!interaction.replied && !interaction.deferred) await interaction.reply('Loading menu...'); // Show the loading message
 
     const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
@@ -1643,29 +1741,36 @@ async function showBrowseAllMenu(interaction, page) {
 
     // Send the updated message
     await interaction.editReply({
-      content: `Browse All Audiobooks (Page ${page + 1}):`,
-      components: rows,
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        buildMenuHeader('Browse All Audiobooks', [
+          `**Page:** ${page + 1}`,
+          `**Showing:** ${paginatedBooks.length} of ${audiobooks.length}`,
+        ]),
+        ...rows,
+      ],
     });
 
     // Delete the loading message
     //await interaction.deleteReply();
   } catch (error) {
     console.error('Error showing browse all menu:', error);
-    await interaction.editReply('An error occurred while loading the browse all menu.');
+    await editReplyAsV2Text(interaction, 'An error occurred while loading the browse all menu.');
   }
 }
 
+/**
+ * Show the genres menu by fetching genres from the #library-catalog channel.
+ */
 async function showGenresMenu(interaction) {
   try {
-    await interaction.editReply({
-      content: `Loading genres...`
-    });
+    await editReplyAsV2Text(interaction, 'Loading genres...');
     const audiobookCatalogChannel = interaction.guild.channels.cache.find(
       (channel) => channel.name === 'library-catalog' && channel.type === 0 // 0 = Text channel
     );
 
     if (!audiobookCatalogChannel) {
-      await interaction.editReply('The #library-catalog channel could not be found.');
+      await editReplyAsV2Text(interaction, 'The #library-catalog channel could not be found.');
       return;
     }
 
@@ -1682,7 +1787,7 @@ async function showGenresMenu(interaction) {
     }
 
     if (genres.length === 0) {
-      await interaction.editReply('No genres found in the #library-catalog channel.');
+      await editReplyAsV2Text(interaction, 'No genres found in the #library-catalog channel.');
       return;
     }
 
@@ -1710,19 +1815,27 @@ async function showGenresMenu(interaction) {
 
     // Send the genre buttons with the back button
     await interaction.editReply({
-      content: 'Select a Genre:',
-      components: [...rows, backButtonRow], // Include all rows and the back button row
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        buildMenuHeader('Genres', [
+          `**Available Genres:** ${genres.length}`,
+          'Choose a category to browse matching audiobooks.',
+        ]),
+        ...rows,
+        backButtonRow,
+      ],
     });
   } catch (error) {
     console.error('Error showing genres menu:', error);
-    await interaction.editReply('An error occurred while loading genres.');
+    await editReplyAsV2Text(interaction, 'An error occurred while loading genres.');
   }
 }
 
+/**
+ * Show books by a specific genre with pagination.
+ */
 async function showGenreBooksMenu(interaction, genre, page) {
-  await interaction.editReply({
-    content: `Loading books in ${genre}...`
-  });
+  await editReplyAsV2Text(interaction, `Loading books in ${genre}...`);
   try {
     const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
     if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
@@ -1732,7 +1845,7 @@ async function showGenreBooksMenu(interaction, genre, page) {
     const paginatedBooks = genreBooks.slice(page * 10, (page + 1) * 10);
 
     if (paginatedBooks.length === 0) {
-      await interaction.editReply(`No books found for the genre: ${genre}`);
+      await editReplyAsV2Text(interaction, `No books found for the genre: ${genre}`);
       return;
     }
     // Create buttons for each book
@@ -1775,60 +1888,75 @@ async function showGenreBooksMenu(interaction, genre, page) {
 
     // Send the updated message
     await interaction.editReply({
-      content: `Books in Genre: ${genre} (Page ${page + 1}):`,
-      components: rows,
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        buildMenuHeader('Genre Books', [
+          `**Genre:** ${genre}`,
+          `**Page:** ${page + 1}`,
+          `**Results:** ${genreBooks.length}`,
+        ]),
+        ...rows,
+      ],
     });
   } catch (error) {
     console.error('Error showing genre books menu:', error);
-    await interaction.editReply('An error occurred while loading books for this genre.');
+    await editReplyAsV2Text(interaction, 'An error occurred while loading books for this genre.');
   }
 }
 
+/**
+ * Show the user's in-progress audiobooks with pagination.
+ */
 async function showInProgressMenu(interaction, page = 0) {
   try {
-    await interaction.editReply({
-      content: `Loading your listens...`
-    });    
+    await editReplyAsV2Text(interaction, 'Loading your listens...');
     const audiobooks = audiobookCache ?? await listAudiobooks(); // Fetch all audiobooks
     if (!audiobookCache) audiobookCache = audiobooks; // Cache the audiobooks
 
     const userId = interaction.user.id;
+    // Always get fresh data from utils instead of using bot.js cache
     const booksInProgress = await getUserBooksInProgress(userId); // Fetch books in progress
 
     if (booksInProgress.length === 0) {
-      await interaction.editReply('You have no audiobooks in progress.');
+      await editReplyAsV2Text(interaction, 'You have no audiobooks in progress.');
       return;
     }
 
     // Ensure the page is within bounds
     if (page < 0 || page >= booksInProgress.length) {
-      await interaction.editReply('Invalid page number.');
+      await editReplyAsV2Text(interaction, 'Invalid page number.');
       return;
     }
 
     // Get the book for the current page
     const book = booksInProgress[page];
-    const audiobookData = audiobooks.find((ab) => ab.title.toLowerCase().includes(book.title.replace(' (Unabridged)', '').split(':')[0].toLowerCase()));
+    // book.title is already normalized when stored, use it directly for matching
+    const audiobookData = audiobooks.find((ab) => ab.title.replace(' (Unabridged)', '').split(':')[0].toLowerCase() === book.title.toLowerCase());
     const bookDuration = audiobookData.playtime; // Total duration of the book
     const { progress, coverImagePath } = await calculateUserProgress(book, bookDuration); // User's progress percentage
     
     const coverImageUrl = getDynamicCoverImageUrl(path.basename(path.normalize(coverImagePath)));
 
-    // Create the embed for the book
-    const embed = new EmbedBuilder()
-    .setTitle(audiobookData.title.replace(' (Unabridged)', '').split(':')[0])
-    .setDescription(`Progress: ${progress}%\n\n${createProgressBar(progress)}`) // Add the progress bar
-    .setThumbnail(coverImageUrl) // Add the cover image
-    .setColor('#0099ff');
+    const progressContainer = buildContainerCard({
+      title: audiobookData.title.replace(' (Unabridged)', '').split(':')[0],
+      bodyLines: [
+        `**Book:** ${page + 1} of ${booksInProgress.length}`,
+        `**Progress:** ${progress}%`,
+        `\`${createProgressBar(progress)}\``,
+      ],
+      imageUrl: coverImageUrl,
+      accentColor: 0x0099ff,
+    });
 
     // Create buttons for "Resume" and "Remove"
+    // Use the stored normalized title directly from book.title to ensure exact match
     const buttons = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId(`resume_${audiobookData.title.replace(' (Unabridged)', '').split(':')[0]}`)
+        .setCustomId(`resume_${book.title}`)
         .setLabel('Resume')
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
-        .setCustomId(`remove_${audiobookData.title.replace(' (Unabridged)', '').split(':')[0]}`)
+        .setCustomId(`remove_${book.title}`)
         .setLabel('Remove')
         .setStyle(ButtonStyle.Danger)
     );
@@ -1851,15 +1979,14 @@ async function showInProgressMenu(interaction, page = 0) {
         .setStyle(ButtonStyle.Danger)
     );
 
-    // Send the embed with buttons
+    // Send the container with buttons
     await interaction.editReply({
-      content: `Book ${page + 1} of ${booksInProgress.length}:`,
-      embeds: [embed],
-      components: [buttons, paginationButtons],
+      flags: MessageFlags.IsComponentsV2,
+      components: [progressContainer, buttons, paginationButtons],
     });
   } catch (error) {
     console.error('Error showing in-progress menu:', error);
-    await interaction.editReply('An error occurred while loading books in progress.');
+    await editReplyAsV2Text(interaction, 'An error occurred while loading books in progress.');
   }
 }
 
@@ -1892,6 +2019,9 @@ async function calculateUserProgress(book, bookDuration) {
   return { progress: progress, coverImagePath: coverImagePath };
 }
 
+/**
+ * Get cached audio duration or fetch and cache it if not present.
+ */
 async function getCachedAudioDuration(filePath) {
   if (audioDurationCache.has(filePath)) {
     // Return the cached duration if it exists
@@ -1904,6 +2034,9 @@ async function getCachedAudioDuration(filePath) {
   return duration;
 }
 
+/**
+ * Get the duration of an audio file using ffprobe.
+ */
 async function getAudioDuration(filePath) {
   return new Promise((resolve, reject) => {
     execFile(
@@ -1919,6 +2052,9 @@ async function getAudioDuration(filePath) {
   });
 }
 
+/**
+ * Fetch Audible Plus titles by executing the Python script.
+ */
 async function fetchAudiblePlusTitles() {
   return new Promise((resolve, reject) => {
     exec('python ./DiscordBot/utils/getAudiblePlusLibrary.py', (error, stdout, stderr) => {
@@ -1938,7 +2074,9 @@ async function fetchAudiblePlusTitles() {
 }
 
 const cacheFilePath = path.join(__dirname, 'temp', 'audiblePlusCache.json');
-
+/**
+ * Update the Audible Plus channel with the latest titles.
+ */
 async function updateAudiblePlusChannel(channelName) {
   try {
     // Check if the cache exists and is recent
@@ -1983,7 +2121,12 @@ async function updateAudiblePlusChannel(channelName) {
 
     // Send a separator message with the current date
     const currentDate = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
-    await channel.send(`**📅 Audible Plus Titles List - Updated on ${currentDate}**`);
+    await channel.send({
+      flags: MessageFlags.IsComponentsV2,
+      components: [
+        buildTextContainer(`## 📅 Audible Plus Titles List\n**Updated on:** ${currentDate}`, 0x5865f2),
+      ],
+    });
 
     // Group books by genres
     const booksByGenre = {};
@@ -1999,28 +2142,23 @@ async function updateAudiblePlusChannel(channelName) {
 
     // Post books by genre
     for (const [genre, books] of Object.entries(booksByGenre)) {
-      const embeds = books.map((title) => {
-        const embed = new EmbedBuilder()
-          .setTitle(`📘 ${title.title}`)
-          .addFields(
-            { name: 'Author(s)', value: title.authors, inline: true },
-            { name: 'Available Until', value: `(${title.days_left} days left)`, inline: true }
-          )
-          .setColor('#0099ff');
+      const containers = books.map((title) => buildAudiblePlusTitleContainer(title, 0x0099ff));
 
-        // Add the cover image if it exists
-        if (title.cover_image && title.cover_image !== 'No Image Available') {
-          embed.setThumbnail(title.cover_image); // Use setThumbnail for a smaller image
-        }
-
-        return embed;
-      });
-
-      // Send embeds in batches of 10
-      for (let i = 0; i < embeds.length; i += 10) {
+      // Send container cards in batches with a genre header.
+      for (let i = 0; i < containers.length; i += 9) {
+        const batchNumber = Math.floor(i / 9) + 1;
+        const totalBatches = Math.ceil(containers.length / 9);
         await channel.send({
-          content: `**Genre: ${genre}**`,
-          embeds: embeds.slice(i, i + 10),
+          flags: MessageFlags.IsComponentsV2,
+          components: [
+            buildTextContainer(
+              totalBatches > 1
+                ? `## Genre: ${genre}\n**Batch:** ${batchNumber} of ${totalBatches}`
+                : `## Genre: ${genre}`,
+              0x5865f2
+            ),
+            ...containers.slice(i, i + 9),
+          ],
         });
       }
     }
@@ -2031,28 +2169,23 @@ async function updateAudiblePlusChannel(channelName) {
       .sort((a, b) => a.days_left - b.days_left); // Sort by days left
 
     if (leavingSoon.length > 0) {
-      const embeds = leavingSoon.map((title) => {
-        const embed = new EmbedBuilder()
-          .setTitle(`📘 ${title.title}`)
-          .addFields(
-            { name: 'Author(s)', value: title.authors, inline: true },
-            { name: 'Available Until', value: `(${title.days_left} days left)`, inline: true }
-          )
-          .setColor('#ff0000'); // Use red to indicate urgency
-
-        // Add the cover image if it exists
-        if (title.cover_image && title.cover_image !== 'No Image Available') {
-          embed.setThumbnail(title.cover_image); // Use setThumbnail for a smaller image
-        }
-
-        return embed;
-      });
+      const containers = leavingSoon.map((title) => buildAudiblePlusTitleContainer(title, 0xff0000));
 
       // Send the "Leaving Soon" section
-      for (let i = 0; i < embeds.length; i += 10) {
+      for (let i = 0; i < containers.length; i += 9) {
+        const batchNumber = Math.floor(i / 9) + 1;
+        const totalBatches = Math.ceil(containers.length / 9);
         await channel.send({
-          content: '**📅 Titles Leaving Soon:**',
-          embeds: embeds.slice(i, i + 10),
+          flags: MessageFlags.IsComponentsV2,
+          components: [
+            buildTextContainer(
+              totalBatches > 1
+                ? `## 📅 Titles Leaving Soon\n**Batch:** ${batchNumber} of ${totalBatches}`
+                : '## 📅 Titles Leaving Soon',
+              0xff0000
+            ),
+            ...containers.slice(i, i + 9),
+          ],
         });
       }
     }
@@ -2061,6 +2194,9 @@ async function updateAudiblePlusChannel(channelName) {
   }
 }
 
+/**
+ * Refresh Audible Plus titles by updating the channel.
+ */
 async function refreshAudiblePlusTitles() {
   try {
     await updateAudiblePlusChannel('included-in-audible-plus');
@@ -2069,11 +2205,20 @@ async function refreshAudiblePlusTitles() {
   }
 }
 
+/**
+ * Get the cover image emoji for a specific audiobook.
+ * @param {*} filePath 
+ * @returns {Promise<string>} Emoji string
+ */
 async function getCoverImageEmoji(filePath) {
   const coverImagePath = await getM4BCoverImage(filePath);
   return coverImagePath; // Placeholder emoji
 }
 
+/**
+ * Ensure the "Add Review" button is present in the channel.
+ * @param {*} channel 
+ */
 async function ensureAddReviewButton(channel) {
   const messages = await channel.messages.fetch({ limit: 10 }); // Fetch the last 10 messages
   const botMessages = messages.filter(msg => msg.author.id === masterBot.user.id && msg.components.length > 0);
@@ -2112,6 +2257,9 @@ function loadUserMessageMap() {
   }
 }
 
+/**
+ * Create a textual progress bar.
+ */
 function createProgressBar(progress) {
   const totalBars = 20; // Total number of bars in the progress bar
   const filledBars = Math.round((progress / 100) * totalBars); // Calculate the number of filled bars
@@ -2121,6 +2269,80 @@ function createProgressBar(progress) {
   return `${bar}`; // Wrap the bar in square brackets
 }
 
+/**
+ * Build a component v2 text container.
+ */
+function buildTextContainer(content, accentColor = 0x5865f2) {
+  return new ContainerBuilder()
+    .setAccentColor(accentColor)
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(content)
+    );
+}
+
+/**
+ * Build a reusable menu header container.
+ */
+function buildMenuHeader(title, bodyLines = [], accentColor = 0x5865f2) {
+  return buildContainerCard({
+    title,
+    bodyLines,
+    accentColor,
+  });
+}
+
+/**
+ * Build a reusable component v2 card container.
+ */
+function buildContainerCard({ title, bodyLines = [], accentColor = 0x0099ff, imageUrl = null }) {
+  const contentLines = [];
+
+  if (title) {
+    contentLines.push(`## ${title}`);
+  }
+
+  const filteredBodyLines = bodyLines.filter((line) => line !== undefined && line !== null && line !== '');
+  if (filteredBodyLines.length > 0) {
+    contentLines.push(...filteredBodyLines);
+  }
+
+  const container = new ContainerBuilder()
+    .setAccentColor(accentColor)
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(contentLines.join('\n'))
+    );
+
+  if (imageUrl) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(
+        new MediaGalleryItemBuilder().setURL(imageUrl)
+      )
+    );
+  }
+
+  return container;
+}
+
+/**
+ * Build an Audible Plus title card container.
+ */
+function buildAudiblePlusTitleContainer(title, accentColor = 0x0099ff) {
+  return buildContainerCard({
+    title: `📘 ${title.title}`,
+    bodyLines: [
+      `**Author(s):** ${title.authors || 'Unknown'}`,
+      `**Available Until:** (${title.days_left} days left)`,
+    ],
+    accentColor,
+    imageUrl: title.cover_image && title.cover_image !== 'No Image Available' ? title.cover_image : null,
+  });
+}
+
+/**
+ * Get the dynamic cover image URL for a specific audiobook.
+ * @param {*} coverImageFile 
+ * @returns {string} Dynamic cover image URL
+ */
 function getDynamicCoverImageUrl(coverImageFile) {
   coverImageFile = path.basename(path.normalize(coverImageFile)).split('\\').at(-1); // Get the file name without the path
   const baseUrl = `http://${coverArtAddress}:${coverArtPort}/images/`; 
@@ -2150,6 +2372,9 @@ function removeUserMessageMap(userID) {
   saveUserMessageMap(userMessageMap);
 }
 
+/**
+ * Check and mount the network drive if not already mounted.
+ */
 function checkAndMountNetworkDrive() {
   if (isDriveMounted) {
     return;
@@ -2213,14 +2438,49 @@ function checkAndMountNetworkDrive() {
   });
 }
 
+/**
+ * Normalize audiobook titles for consistent matching.
+ */
 function normalizeTitle(title) {
-  return title
+  return String(title ?? '')
     .toLowerCase() // Convert to lowercase
     .trim() // Remove leading and trailing whitespace
     .replace(/\s+/g, ' ') // Replace multiple spaces with a single space
     .replace(/[^a-z0-9\s]/g, ''); // Remove special characters
 }
 
+function normalizeBookKey(title) {
+  return normalizeTitle(String(title ?? '').replace(' (Unabridged)', '').split(':')[0]);
+}
+
+function resolveAudiobookTitle(inputTitle, audiobooks = []) {
+  const rawInput = String(inputTitle ?? '').trim();
+  if (!rawInput) return '';
+
+  const inputKey = normalizeBookKey(rawInput);
+  if (!inputKey) return rawInput.replace(' (Unabridged)', '').split(':')[0].trim();
+
+  const exactMatch = audiobooks.find((book) => normalizeBookKey(book.title) === inputKey);
+  if (exactMatch?.title) {
+    return exactMatch.title.replace(' (Unabridged)', '').split(':')[0];
+  }
+
+  const startsWithMatch = audiobooks.find((book) => normalizeBookKey(book.title).startsWith(inputKey));
+  if (startsWithMatch?.title) {
+    return startsWithMatch.title.replace(' (Unabridged)', '').split(':')[0];
+  }
+
+  const containsMatch = audiobooks.find((book) => normalizeBookKey(book.title).includes(inputKey));
+  if (containsMatch?.title) {
+    return containsMatch.title.replace(' (Unabridged)', '').split(':')[0];
+  }
+
+  return rawInput.replace(' (Unabridged)', '').split(':')[0].trim();
+}
+
+/**
+ * Send a request to the media Pi to join the voice channel.
+ */
 function sendStreamPAlToClientVoiceChannel() {
   setTimeout(function(){
     axios.post('http://' + mediaPIIPAddress + ':' + piServicePort + '/join_channel') 
@@ -2233,6 +2493,9 @@ function sendStreamPAlToClientVoiceChannel() {
   }, 5000);
 }
 
+/**
+ * Send a request to start the livestream service on the media Pi.
+ */
 function startLiveStreamService() {
   setTimeout(function(){
     axios.post('http://' + mediaPIIPAddress + ':' + piServicePort + '/start_livestream_service') 

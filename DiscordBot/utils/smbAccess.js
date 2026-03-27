@@ -60,6 +60,10 @@ function saveCache() {
   console.log('Cache saved to file');
 }
 
+/**
+ * List all audiobooks available on the smbService
+ * @returns {Promise<Array>} List of audiobooks from the smbService
+ */
 async function listAudiobooks() {
   try {
     const response = await axios.get(`${hostServiceUrl}/audiobooks`);
@@ -78,6 +82,15 @@ async function listAudiobooks() {
   }
 }
 
+/**
+ * Retrieve the file paths for a specific audiobook chapter and part.
+ * @param {*} fileName 
+ * @param {*} chapter 
+ * @param {*} part 
+ * @param {*} startTime 
+ * @param {*} speed 
+ * @returns {Promise<Object>} 
+ */
 async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime = 0, speed = 1) {
   fileName = path.basename(path.normalize(fileName)); // Get the file name without the path
   const audiobookDir = path.join(baseDir, fileName.split('.')[0]);
@@ -144,6 +157,15 @@ async function retrieveAudiobookFilePaths(fileName, chapter, part = 0, startTime
 // Define a cache for metadata and cover image paths
 const metaDataCacheMap = new Map();
 
+/**
+ * Retrieve audiobook file paths based on user input and playback parameters.
+ * @param {*} userInput 
+ * @param {*} chapter 
+ * @param {*} part 
+ * @param {*} timestamp 
+ * @param {*} speed 
+ * @returns {Promise<Object>} 
+*/
 async function selectAudiobookAndRetrievePaths(userInput, chapter, part = 0, timestamp = 0, speed = 1) {
   try {
     // Find the closest matching audiobook file
@@ -209,6 +231,27 @@ getFileNameFromTitle = (title) => {
   return titleToFileMap[title]; 
 }
 
+function normalizeTitleKey(value) {
+  return String(value ?? '')
+    .replace(' (Unabridged)', '')
+    .split(':')[0]
+    .trim()
+    .toLowerCase();
+}
+
+function getMappedFileName(title) {
+  const normalizedTitle = normalizeTitleKey(title);
+  if (!normalizedTitle) return null;
+
+  for (const [mappedTitle, mappedFile] of Object.entries(titleToFileMap ?? {})) {
+    if (normalizeTitleKey(mappedTitle) === normalizedTitle && typeof mappedFile === 'string' && mappedFile.trim()) {
+      return path.basename(path.normalize(mappedFile));
+    }
+  }
+
+  return null;
+}
+
 /** Returns the title file for the audiobook .m4b 
  *  Given the title key: userInput*/
 async function findClosestTitleFile(userInput) {
@@ -219,21 +262,25 @@ async function findClosestTitleFile(userInput) {
 
     const titles = audiobooks.map((book) => book.title); // Extract titles from the list
 
-    const normalizedInput = userInput;
+    const normalizedInput = String(userInput ?? '').trim();
+    if (!normalizedInput) {
+      throw new Error('No audiobook title provided to findClosestTitleFile');
+    }
 
     // 1. Check for exact matches first
-    const exactMatch = titles.find((title) => title.toLowerCase().includes(normalizedInput.toLowerCase()));
+    const normalizedInputKey = normalizeTitleKey(normalizedInput);
+    const exactMatch = titles.find((title) => normalizeTitleKey(title) === normalizedInputKey);
     if (exactMatch) {
-      let fileName = titleToFileMap[exactMatch.replace(' (Unabridged)', '').split(":")[0]]; // Get the file name from the map
-      if (fileName) return path.basename(path.normalize(fileName)); // Return the mapped filename
+      const fileName = getMappedFileName(exactMatch);
+      if (fileName) return fileName;
     }
 
     // 2. Check for a prefix match
-    const prefixPattern = new RegExp(`^${normalizedInput}:`, 'i');
-    const prefixMatch = titles.find((title) => prefixPattern.test(title));
+    const prefixPattern = new RegExp(`^${normalizedInput.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i');
+    const prefixMatch = titles.find((title) => prefixPattern.test(title.trim()));
     if (prefixMatch) {
-      let fileName = titleToFileMap[prefixMatch.replace(' (Unabridged)', '').split(":")[0]]; // Get the file name from the map
-      if (fileName) return path.basename(path.normalize(fileName)); // Return the mapped filename
+      const fileName = getMappedFileName(prefixMatch);
+      if (fileName) return fileName;
     }
 
     // 3. Use fuzzy matching with token sorting
@@ -249,17 +296,27 @@ async function findClosestTitleFile(userInput) {
     // 4. Ensure the match is strong enough
     const MIN_SCORE_THRESHOLD = 40;
     if (bestMatch && bestMatch[1] >= MIN_SCORE_THRESHOLD) {
-      let title = bestMatch[0].replace(' (Unabridged)', '').split(':')[0]
-      return path.basename(path.normalize(titleToFileMap[title])); // Return the mapped filename
+      const fileName = getMappedFileName(bestMatch[0]);
+      if (fileName) return fileName;
+
+      const fallbackBook = audiobooks.find((book) => normalizeTitleKey(book.title) === normalizeTitleKey(bestMatch[0]));
+      if (fallbackBook && typeof fallbackBook.file === 'string' && fallbackBook.file.trim()) {
+        return path.basename(path.normalize(fallbackBook.file));
+      }
     }
 
-    return null; // No match found
+    throw new Error(`No matching audiobook file found for input: ${userInput}`);
   } catch (error) {
     console.error('Error finding closest match', error);
     throw error;
   }
 }
 
+/**
+ * Get the title of an audiobook from its file name.
+ * @param {*} fileName 
+ * @returns {Promise<string|null>} The title of the audiobook or null if not found.
+ */
 async function getAudiobookTitleFromFile(fileName) {
   try {
     // Fetch the list of audiobooks
@@ -275,6 +332,9 @@ async function getAudiobookTitleFromFile(fileName) {
   }
 }
 
+/**
+ * Update the audiobook cache with the latest data.
+ */
 async function updateAudiobookCache() {
   try {
     // Fetch the list of audiobooks using listAudiobooks
@@ -297,17 +357,83 @@ async function updateAudiobookCache() {
   }
 }
 
+/**
+ * Get autocomplete choices for audiobook titles.
+ * @param {string} query
+ * @param {number} limit
+ * @returns {Promise<Array<{name: string, value: string}>>}
+ */
+async function getAudiobookAutocompleteChoices(query = '', limit = 25) {
+  const maxChoices = Math.max(1, Math.min(limit, 25));
+  const normalizedQuery = String(query || '').trim().toLowerCase();
+
+  let audiobookTitles = [];
+
+  if (Array.isArray(cachedAudiobooks) && cachedAudiobooks.length > 0) {
+    audiobookTitles = cachedAudiobooks
+      .map((book) => book?.title)
+      .filter(Boolean);
+  } else if (Object.keys(titleToFileMap).length > 0) {
+    audiobookTitles = Object.keys(titleToFileMap);
+  } else {
+    try {
+      await updateAudiobookCache();
+      audiobookTitles = (cachedAudiobooks || []).map((book) => book?.title).filter(Boolean);
+    } catch (error) {
+      console.error('Error preparing audiobook autocomplete cache:', error);
+      audiobookTitles = [];
+    }
+  }
+
+  const uniqueTitles = [...new Set(audiobookTitles)];
+  const filteredTitles = normalizedQuery
+    ? uniqueTitles.filter((title) => title.toLowerCase().includes(normalizedQuery))
+    : uniqueTitles;
+
+  filteredTitles.sort((a, b) => {
+    const aStarts = a.toLowerCase().startsWith(normalizedQuery);
+    const bStarts = b.toLowerCase().startsWith(normalizedQuery);
+    if (aStarts !== bStarts) return aStarts ? -1 : 1;
+    return a.localeCompare(b);
+  });
+
+  return filteredTitles.slice(0, maxChoices).map((title) => {
+    const normalizedValue = title.replace(' (Unabridged)', '').split(':')[0].trim();
+    return {
+      name: title.slice(0, 100),
+      value: normalizedValue.slice(0, 100),
+    };
+  });
+}
+
+/**
+ * Get the list of audiobooks currently in progress for a user.
+ * @param {*} userId 
+ * @returns {Promise<Array>} List of audiobooks in progress for the user.
+ */
 async function getUserBooksInProgress(userId) {
-  loadUserPositions();
+  // Only reload if file has changed (optimized)
+  loadUserPositionsCacheIfNeeded();
+  
   if (!userPositionsCache[userId]) {
     return [];
   }
-  return Object.keys(userPositionsCache[userId]).map(title => ({
-    title: title.toLowerCase(), // Normalize title to lowercase
+  const books = Object.keys(userPositionsCache[userId]).map(title => ({
+    title: title, // Keep the original title case for proper key matching
     ...userPositionsCache[userId][title]
   }));
+  console.log(`[SMBACCESS DEBUG] getUserBooksInProgress for ${userId}: Found ${books.length} books:`, books.map(b => b.title));
+  return books;
 }
 
+/**
+ * Retrieve the file paths for a specific audiobook chapter and part.
+ * @param {*} filePath 
+ * @param {*} startTime 
+ * @param {*} speed 
+ * @param {*} action 
+ * @returns {Promise<Object>}
+*/
 async function processFile(filePath, startTime = 0, speed = 1, action = 'seek') {
   try {
     const response = await axios.post(`${hostServiceUrl}/process`, {
@@ -335,15 +461,50 @@ async function deleteTempFile(tempFilePath) {
   }
 }
 
-async function loadUserPositionsCache() {
+let isSaving = false;
+let lastUserPositionFileModTime = 0; // Track file modification time
+let lastUserPositionLoadTime = 0; // Track when we last loaded
+const USER_POSITION_RELOAD_COOLDOWN = 1000; // Don't reload more than once per second
+
+/**
+ * Load user positions cache from file, but only if the file has actually changed.
+ */
+function loadUserPositionsCacheIfNeeded() {
+  try {
+    if (fs.existsSync(userPositionFilePath)) {
+      const stat = fs.statSync(userPositionFilePath);
+      const fileModTime = stat.mtimeMs;
+      const timeSinceLastLoad = Date.now() - lastUserPositionLoadTime;
+      
+      // Only reload if file is newer than last load AND cooldown has passed
+      if (fileModTime > lastUserPositionFileModTime && timeSinceLastLoad > USER_POSITION_RELOAD_COOLDOWN) {
+        const fileData = fs.readFileSync(userPositionFilePath, 'utf-8');
+        if (fileData.trim()) {
+          const existingData = JSON.parse(fileData);
+          userPositionsCache = existingData; // Replace entire cache atomically
+          lastUserPositionFileModTime = fileModTime;
+          lastUserPositionLoadTime = Date.now();
+        }
+      }
+    } 
+  } catch (error) {
+    console.error('loadUserPositionsCacheIfNeeded: Error checking/loading user positions:', error);
+  }
+}
+
+/**
+ * Load user positions cache from file.
+ */
+function loadUserPositionsCache() {
   try {
     if (fs.existsSync(userPositionFilePath)) {
       const fileData = fs.readFileSync(userPositionFilePath, 'utf-8');
       if (fileData.trim()) {
         const existingData = JSON.parse(fileData);
-        for (const [userID, userAudiobooks] of Object.entries(existingData)) {
-          userPositionsCache[userID] = userAudiobooks;
-        }
+        userPositionsCache = existingData; // Replace entire cache atomically
+        const stat = fs.statSync(userPositionFilePath);
+        lastUserPositionFileModTime = stat.mtimeMs;
+        lastUserPositionLoadTime = Date.now();
       } 
     } 
   } catch (error) {
@@ -351,22 +512,16 @@ async function loadUserPositionsCache() {
   }
 }
 
+/**
+ * Load user positions (backward compatibility alias).
+ */
 function loadUserPositions() {
-  try {
-    if (fs.existsSync(userPositionFilePath)) {
-      const fileData = fs.readFileSync(userPositionFilePath, 'utf8');
-      userPositionsCache = JSON.parse(fileData);
-    } else {
-      userPositionsCache = {};
-    }
-  } catch (error) {
-    console.error('Error loading user positions. Resetting to an empty object:', error);
-    userPositionsCache = {}; // Reset to an empty object if the file is invalid
-  }
+  loadUserPositionsCache();
 }
 
-let isSaving = false;
-
+/**
+ * Save user positions to file.
+ */
 function saveUserPositionsToFile() {
   if (isSaving) {
     console.log('Save operation already in progress. Skipping this call.');
@@ -392,7 +547,10 @@ function scheduleUserPositionSaving() {
 
 // Retrieve user's last played timestamp from memory
 function getUserPosition(userId, bookTitle) {
-  if (!userPositionsCache[userId]) loadUserPositionsCache();
+  // Check cache first (optimized - only reload if file changed)
+  if (!userPositionsCache[userId]) {
+    loadUserPositionsCacheIfNeeded();
+  }
   const userPositions = userPositionsCache[userId] || {};
   return userPositions[bookTitle] || null; // Use the original title as the key
 }
@@ -415,6 +573,11 @@ function scheduleCacheUpdates() {
   }
 }
 
+/**
+ * Get the chapter count for a specific audiobook.
+ * @param {*} title 
+ * @returns {Promise<number>} The number of chapters in the audiobook. 
+ */
 async function getChapterCount(title) {
   let fileName = await findClosestTitleFile(title);
   if (!fileName) {
@@ -443,8 +606,71 @@ async function getChapterCount(title) {
   return chapterCount;
 }
 
+/**
+ * Remove a user's position for a specific audiobook.
+ * @param {*} userId 
+ * @param {*} bookTitle 
+ * @returns {Promise<void>}
+ */
+async function removeUserPosition(userId, bookTitle) {
+  try {
+    // Ensure cache is loaded but don't wipe existing data
+    if (Object.keys(userPositionsCache).length === 0) {
+      loadUserPositionsCache();
+    }
+    console.log(`[removeUserPosition] Attempting to remove book "${bookTitle}" for user ${userId}`);
+
+    if (!userPositionsCache[userId]) {
+      console.log(`[removeUserPosition] User ${userId} has no positions stored`);
+      return;
+    }
+
+    // Log all stored keys for this user
+    const storedKeys = Object.keys(userPositionsCache[userId]);
+    console.log(`[removeUserPosition] Stored keys for user:`, storedKeys);
+
+    // Try exact match first
+    if (userPositionsCache[userId][bookTitle]) {
+      console.log(`[removeUserPosition] Found exact match, deleting "${bookTitle}"`);
+      delete userPositionsCache[userId][bookTitle];
+    } else {
+      // Try to find a matching key (case-insensitive, normalized comparison)
+      const normalizedSearchTitle = bookTitle.toLowerCase().trim();
+      const matchingKey = storedKeys.find(key => {
+        const normalizedKey = key.toLowerCase().trim();
+        return normalizedKey === normalizedSearchTitle || 
+               normalizedKey.includes(normalizedSearchTitle) ||
+               normalizedSearchTitle.includes(normalizedKey);
+      });
+
+      if (matchingKey) {
+        console.log(`[removeUserPosition] Found matching key "${matchingKey}" for search "${bookTitle}", deleting...`);
+        delete userPositionsCache[userId][matchingKey];
+      } else {
+        console.warn(`[removeUserPosition] Could not find matching key for "${bookTitle}"`);
+        console.warn(`[removeUserPosition] Available keys:`, storedKeys);
+        return; // Exit early if no match found
+      }
+    }
+
+    // If user has no more books, remove the user entry entirely
+    if (Object.keys(userPositionsCache[userId] || {}).length === 0) {
+      console.log(`[removeUserPosition] User has no more books, removing user entry`);
+      delete userPositionsCache[userId];
+    }
+
+    // Save to file
+    console.log(`[removeUserPosition] Saving updated positions to file...`);
+    saveUserPositionsToFile();
+    console.log(`[removeUserPosition] Book removed successfully`);
+  } catch (error) {
+    console.error('[removeUserPosition] Error removing user position:', error);
+  }
+}
+
 // Load cache on startup
 loadCache();
+loadUserPositionsCache(); // Also load user positions on startup
 scheduleCacheUpdates();
 
 module.exports = {
@@ -462,5 +688,9 @@ module.exports = {
   scheduleUserPositionSaving,
   getUserBooksInProgress,
   saveCache,
-  getAudiobookTitleFromFile
+  getAudiobookTitleFromFile,
+  getAudiobookAutocompleteChoices,
+  removeUserPosition,
+  userPositionsCache,
+  saveUserPositionsToFile,
 };

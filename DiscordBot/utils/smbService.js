@@ -17,7 +17,37 @@ const os = require('os'); // Import the os module
 const imageDirectory = path.join(audiobooksDir, 'temp');
 
 const downloadHost = express();
-const imageHost = express();
+const imageHost = express(); 
+
+// Log ALL requests to downloadHost
+downloadHost.use((req, res, next) => {
+  console.log(`[DOWNLOAD] ${req.method} ${req.url} from ${req.ip}`);
+  console.log(`[DOWNLOAD] Full URL: ${req.protocol}://${req.get('host')}${req.originalUrl}`);
+  console.log(`[DOWNLOAD] Headers:`, JSON.stringify(req.headers, null, 2));
+  
+  // Check if file exists
+  if (req.url.startsWith('/downloads/')) {
+    const fileName = decodeURIComponent(req.url.replace('/downloads/', ''));
+    const fullPath = path.join(audiobooksDir, fileName);
+    console.log(`[DOWNLOAD] Looking for file: ${fullPath}`);
+    console.log(`[DOWNLOAD] File exists: ${fs.existsSync(fullPath)}`);
+  }
+  
+  // Track response errors
+  res.on('error', (err) => {
+    console.error('[DOWNLOAD] Response error:', err);
+  });
+  
+  res.on('close', () => {
+    console.log(`[DOWNLOAD] Response closed for ${req.url}`);
+  });
+  
+  res.on('finish', () => {
+    console.log(`[DOWNLOAD] Response finished for ${req.url}`);
+  });
+  
+  next();
+});
 
 imageHost.use('/images', express.static(imageDirectory, {
   fallthrough: false, // Ensure that requests are not passed to the next middleware if the file is not found
@@ -41,24 +71,33 @@ imageHost.get('*', (req, res) => {
 });
 
 downloadHost.use('/downloads', express.static(audiobooksDir, {
-  fallthrough: false, // Ensure that requests are not passed to the next middleware if the file is not found
-  setHeaders: (res, path) => {
-    res.set('Content-Type', 'audio/m4b'); // Set the content type to audio/m4b
+  fallthrough: false,
+  setHeaders: (res, filePath) => {
+    // Force download instead of inline display
+    res.set('Content-Disposition', `attachment; filename="${encodeURIComponent(path.basename(filePath))}"`);
+    res.set('Content-Type', 'audio/m4b');
+    res.set('Accept-Ranges', 'bytes'); // Enable range requests for resume/progress
+    console.log(`[DOWNLOAD] Serving file: ${filePath}`);
   }
 }));
 
+// Error handler must be BEFORE listen
+downloadHost.use((err, req, res, next) => {
+  console.error('[DOWNLOAD] Error serving download:', err);
+  console.error('[DOWNLOAD] Error stack:', err.stack);
+  if (!res.headersSent) {
+    res.status(500).send('Internal Server Error');
+  }
+});
+
+// Catch-all 404 handler
+downloadHost.use((req, res) => {
+  console.log('404 - Not found:', req.url);
+  res.status(404).send('File Not Found');
+});
+
 downloadHost.listen(downloadPort, '0.0.0.0', () => {
   console.log(`Download server running on port ${downloadPort}/downloads/`);
-});
-
-downloadHost.use((err, req, res, next) => {
-  console.error('Error serving download');
-  res.status(500).send('Internal Server Error');
-});
-
-downloadHost.get('*', (req, res) => {
-  console.log('Request for:', req.url);
-  res.status(404).send('Not Found');
 });
 
 // Ensure the temp directory exists
@@ -233,4 +272,14 @@ app.delete('/temp', (req, res) => {
 // Start the service
 app.listen(port, () => {
   console.log(`SMB service running on port ${port}`);
+});
+
+// Global error handlers
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  console.error('Stack:', err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
